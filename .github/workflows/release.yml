@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The tag must match the version in build.zig.zon, and CHANGELOG.md must
+      # have an entry for it (`zig build ci` checks the latter on every push).
+      - name: Check version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in build.zig.zon ($version)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          awk -v heading="## [$VERSION] - " '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found && /^\[[^]]+\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no entry for $VERSION."
+            exit 1
+          fi
+          cat notes.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "v$VERSION" --notes-file notes.md

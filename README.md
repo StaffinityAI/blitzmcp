@@ -20,7 +20,7 @@ Derived from [zigtools/lsp-kit](https://github.com/zigtools/lsp-kit). The JSON-R
 > Requires Zig `0.17.0` or later.
 
 ```bash
-zig fetch --save git+https://github.com/StaffinityAI/blitzmcp.git
+zig fetch --save git+https://github.com/StaffinityAI/blitzmcp.git#v0.1.0
 ```
 
 ```zig
@@ -116,15 +116,29 @@ With `.concurrency = .concurrent` in the server config, every request is handled
 
 Handlers must be thread-safe in this mode, e.g. protect shared state with a `std.Io.Mutex`. It needs an `Io` implementation with concurrency such as `std.Io.Threaded` (what `std.process.Init` provides); otherwise requests are handled one after another. The default, `.concurrency = .serial`, handles one message at a time, and `ctx.request` returns `error.RequestsUnavailable`. See `examples/stdio_server.zig`.
 
+# Versioning
+
+Releases are tagged `vX.Y.Z` and follow [Semantic Versioning](https://semver.org/); before 1.0.0, minor versions may contain breaking changes. See [`CHANGELOG.md`](CHANGELOG.md) for the changes in each release.
+
 # Development
 
 ```bash
 zig build test   # unit tests
 zig build e2e    # end-to-end tests: the official MCP TypeScript SDK client drives examples/stdio_server.zig (requires Node.js and npm)
-zig build ci     # everything CI runs: format check, unit tests, build, docs and e2e tests
+zig build ci     # everything CI runs: format and changelog checks, unit tests, build, docs and e2e tests
 zig build ci -Doptimize=ReleaseSafe  # CI also runs everything in ReleaseSafe
 zig build test --fuzz=30K -Duse-llvm  # fuzz the message handler, the NDJSON reader and the result checks
 ```
 
 The fuzz targets are the tests named `fuzz …` (`fuzz handleMessage`, `fuzz readNdjsonMessage`, `fuzz checkJson`); `--fuzz` is not supported on Windows, and needs `-Duse-llvm` on x86_64 (the self-hosted backend emits no coverage instrumentation). CI fuzzes them with a new `--seed` for every run. `zig build test --fuzz` exits with code 0 even when it finds a failing input, so check for `.zig-cache/f/crash`, which contains the input (CI uploads it as the `fuzz-crash` artifact). To reproduce a failure and keep it as a regression test, add the file (via `@embedFile`) to the `corpus` of the failing `std.testing.fuzz` call; `zig build test` always runs the corpus.
 
+## Releasing
+
+1. Move the entries under `## [Unreleased]` in `CHANGELOG.md` to a new `## [X.Y.Z] - YYYY-MM-DD` section, update the links at the bottom, and set `.version = "X.Y.Z"` in `build.zig.zon` (`zig build ci` fails if the version has no changelog entry).
+2. Merge to `main`, then tag the merge commit and push the tag:
+
+   ```bash
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   ```
+
+   The release workflow checks that the tag matches `build.zig.zon` and creates the GitHub release with the changelog entry as notes.
