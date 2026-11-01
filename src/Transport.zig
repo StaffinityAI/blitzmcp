@@ -456,3 +456,69 @@ test "Stream - read and write uncancelable" {
     try transport.writeJsonMessageUncancelable(io, message);
     try std.testing.expectEqualStrings("{\"a\":1}\n", aw.written());
 }
+
+test "fuzz readNdjsonMessage" {
+    try std.testing.fuzz({}, fuzzReadNdjsonMessage, .{ .corpus = &fuzz_ndjson_corpus });
+}
+
+/// Each entry: the input, then `max_len` and the reader buffer size.
+const fuzz_ndjson_corpus = blk: {
+    const smithSlice = @import("server.zig").smithSlice;
+    const smithInt = @import("server.zig").smithInt;
+    break :blk [_][]const u8{
+        // Normal lines, `\r` stripping, blank lines and a reader buffer smaller than a line.
+        smithSlice("{}\n\r\n \t\n{\"a\":1}\r\n[1,2]") ++ smithInt(64) ++ smithInt(3),
+        // A line that is too long, followed by normal ones.
+        smithSlice("123456\nab\r\r\n{}") ++ smithInt(5) ++ smithInt(2),
+        // A line exactly at the limit and a final line without a newline.
+        smithSlice("12345\n1234") ++ smithInt(5) ++ smithInt(32),
+    };
+};
+
+/// Compares `readNdjsonMessage` with a simple reference implementation for
+/// random input, size limits and reader buffer sizes.
+fn fuzzReadNdjsonMessage(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    var input_buffer: [1024]u8 = undefined;
+    const input = input_buffer[0..smith.sliceWeightedBytes(&input_buffer, &.{
+        .rangeAtMost(u8, 0x00, 0xff, 1),
+        .value(u8, '\n', 4),
+        .value(u8, '\r', 2),
+        .value(u8, ' ', 2),
+        .rangeAtMost(u8, 'a', 'c', 4),
+    })];
+    const max_len: usize = smith.valueRangeAtMost(u8, 0, 64);
+    const buffer_len: usize = smith.valueRangeAtMost(u8, 1, 32);
+
+    var source: std.Io.Reader = .fixed(input);
+    var reader_buffer: [32]u8 = undefined;
+    var limited = source.limited(.unlimited, reader_buffer[0..buffer_len]);
+    const reader = &limited.interface;
+
+    var expected = std.mem.splitScalar(u8, input, '\n');
+    while (true) {
+        // The reference: split by '\n', check the size limit on the raw line,
+        // strip trailing '\r', skip lines that only contain spaces and tabs.
+        const want: ?[]const u8, const too_long = while (expected.next()) |raw| {
+            if (raw.len > max_len) break .{ null, true };
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (std.mem.trim(u8, line, " \t").len != 0) break .{ line, false };
+        } else .{ null, false };
+
+        const got = readNdjsonMessage(reader, gpa, max_len) catch |err| switch (err) {
+            error.MessageTooLong => {
+                try std.testing.expect(too_long);
+                continue;
+            },
+            error.EndOfStream => {
+                try std.testing.expect(!too_long);
+                try std.testing.expectEqual(null, want);
+                return;
+            },
+            else => return err,
+        };
+        defer gpa.free(got);
+        try std.testing.expect(!too_long);
+        try std.testing.expectEqualStrings(want orelse return error.TestUnexpectedMessage, got);
+    }
+}

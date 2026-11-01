@@ -29,6 +29,8 @@ const types = @import("types.zig");
 const schema = @import("schema.zig");
 const Transport = @import("Transport.zig");
 
+/// Problems a client can cause are never logged at `err` level: client input
+/// must not be able to make the server look broken (and `err` logs fail tests).
 const log = std.log.scoped(.mcp);
 
 const stringify_options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
@@ -347,7 +349,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 .response => |response| {
                     if (@hasDecl(Handler, "onResponse")) {
                         toErrorUnion(callInjected(self.handler, &ctx, Handler.onResponse, response)) catch |err| {
-                            log.err("failed to handle response: {}", .{err});
+                            log.warn("failed to handle response: {}", .{err});
                         };
                     }
                 },
@@ -408,7 +410,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 const code = errorCode(err);
                 if (code == .internal_error) {
-                    log.err("failed to handle '{s}' request: {}", .{ method, err });
+                    log.warn("failed to handle '{s}' request: {}", .{ method, err });
                 } else {
                     log.debug("failed to handle '{s}' request: {}", .{ method, err });
                 }
@@ -505,7 +507,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                         paramsOrEmpty(notification.params),
                         .{ .ignore_unknown_fields = true },
                     ) catch |err| {
-                        log.err("invalid params for '{s}' notification: {}", .{ method, err });
+                        log.debug("invalid params for '{s}' notification: {}", .{ method, err });
                         return;
                     };
                     const result = callInjected(self.handler, ctx, @field(Handler, method), params);
@@ -513,7 +515,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                         @compileError(std.fmt.comptimePrint("The '{}.{f}' function must return void", .{ Handler, std.zig.fmtId(method) }));
                     }
                     toErrorUnion(result) catch |err| {
-                        log.err("failed to handle '{s}' notification: {}", .{ method, err });
+                        log.warn("failed to handle '{s}' notification: {}", .{ method, err });
                     };
                     return;
                 }
@@ -749,7 +751,7 @@ fn writeFallbackError(
     var buffer: [4096]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buffer);
     transport.writeErrorResponse(io, fba.allocator(), id, .{ .code = code, .message = message }, stringify_options) catch |err| switch (err) {
-        error.OutOfMemory => log.err("failed to report an error: the request id is too long", .{}),
+        error.OutOfMemory => log.warn("failed to report an error: the request id is too long", .{}),
         else => |e| return e,
     };
 }
@@ -1408,4 +1410,376 @@ test "deeply nested and raw results are rejected instead of crashing" {
     var server: S = .init(&handler);
     try server.run(std.testing.io, std.testing.allocator, &stream.transport);
     try std.testing.expect(std.mem.startsWith(u8, aw.written(), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[],\"structuredContent\":[[[["));
+}
+
+// ----------------------------------------------------------------------------
+// Fuzz tests
+//
+// `zig build test` only runs the corpus. Use `zig build test --fuzz=<n>` to
+// fuzz. Note that `--fuzz` exits with code 0 even when it finds a failure; the
+// failing input is saved to `.zig-cache/f/crash`.
+// ----------------------------------------------------------------------------
+
+/// Encodes `bytes` like `std.testing.Smith.slice` reads them: a 4-byte
+/// little-endian length followed by the bytes.
+pub fn smithSlice(comptime bytes: []const u8) []const u8 {
+    const len: u32 = bytes.len;
+    return &[4]u8{ @truncate(len), @truncate(len >> 8), @truncate(len >> 16), @truncate(len >> 24) } ++ bytes;
+}
+
+/// Encodes an unsigned integer (or bool) like `std.testing.Smith.value` and
+/// `valueRangeAtMost` read them: 8 little-endian bytes.
+pub fn smithInt(comptime value: u64) []const u8 {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    const final = bytes;
+    return &final;
+}
+
+const FuzzHandler = struct {
+    counter: i64 = 0,
+
+    fn echo(args: struct { text: []const u8 }) []const u8 {
+        return args.text;
+    }
+    /// Passes untrusted, arbitrarily nested JSON through to the result.
+    fn echoJson(args: struct { value: std.json.Value }) types.CallToolResult {
+        return .{ .content = &.{}, .structuredContent = .{ .value = args.value } };
+    }
+    fn add(handler: *FuzzHandler, ctx: *Context, args: struct { by: i64 = 1 }) !struct { value: i64 } {
+        handler.counter = std.math.add(i64, handler.counter, args.by) catch
+            return ctx.fail(error.Overflow, "overflow", .{});
+        return .{ .value = handler.counter };
+    }
+    fn progress(ctx: *Context, args: struct { steps: u8 = 1, total: ?f64 = null, message: ?[]const u8 = null }) !void {
+        for (0..@min(args.steps, 8)) |i| try ctx.sendProgress(@floatFromInt(i), args.total, args.message);
+        try ctx.logf(.info, "{d} steps", .{args.steps});
+    }
+    fn fail(ctx: *Context, args: struct { message: []const u8 }) !void {
+        return ctx.fail(error.Failed, "{s}", .{args.message});
+    }
+    fn greet(args: struct { name: []const u8, greeting: ?[]const u8 = null }) []const u8 {
+        _ = args.greeting;
+        return args.name;
+    }
+
+    pub fn @"resources/read"(params: types.ReadResourceRequestParams) !types.ReadResourceResult {
+        if (!std.mem.eql(u8, params.uri, "file:///a")) return error.ResourceNotFound;
+        return .{ .contents = &.{.{ .text = .{ .uri = "file:///a", .text = "a" } }} };
+    }
+    pub fn @"notifications/cancelled"(params: types.CancelledNotificationParams) void {
+        _ = params;
+    }
+    pub fn onResponse(response: json_rpc.JsonRPCMessage.Response) void {
+        _ = response;
+    }
+};
+
+const FuzzServer = Server(FuzzHandler, .{
+    .name = "fuzz",
+    .version = "0",
+    .tools = .{
+        .{ .name = "echo", .call = FuzzHandler.echo },
+        .{ .name = "echoJson", .call = FuzzHandler.echoJson },
+        .{ .name = "add", .call = FuzzHandler.add },
+        .{ .name = "progress", .call = FuzzHandler.progress },
+        .{ .name = "fail", .call = FuzzHandler.fail },
+    },
+    .prompts = .{
+        .{ .name = "greet", .call = FuzzHandler.greet },
+    },
+});
+
+/// Each entry is one input: newline-separated messages sent to the same server.
+const fuzz_message_corpus = [_][]const u8{
+    smithSlice(
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+        \\{"jsonrpc":"2.0","id":"a","method":"ping"}
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"cursor":"x"}}
+    ),
+    smithSlice(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"h\u00e9 \ud800"}}}
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echoJson","arguments":{"value":[[[{"a":[1.5,-2,"x",null,true]}]]]}}}
+    ),
+    smithSlice(
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"add","arguments":{"by":9223372036854775807}}}
+        \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"add","arguments":{"by":1}}}
+    ),
+    smithSlice(
+        \\{"jsonrpc":"2.0","id":7,"method":"logging/setLevel","params":{"level":"warning"}}
+        \\{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"progress","arguments":{"steps":3,"total":1e308,"message":"m"},"_meta":{"progressToken":"t"}}}
+        \\{"jsonrpc":"2.0","id":9,"method":"logging/setLevel","params":{"level":"debug"}}
+        \\{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"progress","arguments":{"steps":1}}}
+    ),
+    smithSlice(
+        \\{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"fail","arguments":{"message":"oops"}}}
+        \\{"jsonrpc":"2.0","id":12,"method":"prompts/get","params":{"name":"greet","arguments":{"name":"Zig"}}}
+        \\{"jsonrpc":"2.0","id":13,"method":"prompts/list"}
+        \\{"jsonrpc":"2.0","id":14,"method":"resources/read","params":{"uri":"file:///a"}}
+    ),
+    smithSlice(
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3,"reason":"r"}}
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":[]}}
+        \\{"jsonrpc":"2.0","id":15,"result":{"roots":[]}}
+        \\{"jsonrpc":"2.0","id":16,"error":{"code":-32601,"message":"no"}}
+        \\{"jsonrpc":"2.0","id":17,"result":{},"error":{"code":1,"message":"x"}}
+    ),
+    smithSlice(
+        \\[{"jsonrpc":"2.0","id":18,"method":"ping"}]
+        \\{"jsonrpc":"2.0","id":null,"method":"ping","params":null}
+        \\{"jsonrpc":"1.0","id":19,"method":"ping"}
+        \\{"jsonrpc":"2.0","id":1.5,"method":"ping"}
+        \\not json
+    ),
+};
+
+test "fuzz handleMessage" {
+    try std.testing.fuzz({}, fuzzHandleMessage, .{ .corpus = &fuzz_message_corpus });
+}
+
+fn fuzzHandleMessage(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    var buffer: [4096]u8 = undefined;
+    const input = buffer[0..smith.slice(&buffer)];
+
+    var reader: std.Io.Reader = .fixed("");
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    var stream: Transport.Stream = .init(&reader, &aw.writer);
+    var handler: FuzzHandler = .{};
+    var server: FuzzServer = .init(&handler);
+
+    // Several messages for the same server, so that sequences (e.g.
+    // `logging/setLevel` followed by a tool call) are fuzzed too.
+    var messages = std.mem.splitScalar(u8, input, '\n');
+    while (messages.next()) |message| {
+        const start = aw.written().len;
+        try server.handleMessage(std.testing.io, gpa, &stream.transport, message);
+        try checkFuzzOutput(message, aw.written()[start..]);
+    }
+}
+
+/// Checks the output for one message against what the reply must look like,
+/// which is determined independently of the server.
+fn checkFuzzOutput(message: []const u8, output: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var arena_allocator: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const Expected = union(enum) {
+        response_to: json_rpc.ID,
+        /// An error response with this id (`null` if the id cannot be determined).
+        error_response: ?json_rpc.ID,
+        nothing,
+    };
+    const expected: Expected = if (std.json.parseFromSliceLeaky(
+        json_rpc.JsonRPCMessage,
+        arena,
+        message,
+        .{ .ignore_unknown_fields = true },
+    )) |parsed| switch (parsed) {
+        .request => |request| .{ .response_to = request.id },
+        .notification, .response => .nothing,
+    } else |_| .{ .error_response = expectedErrorId(arena, message) };
+
+    if (output.len != 0) try std.testing.expectEqual('\n', output[output.len - 1]);
+
+    var responses: usize = 0;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        // Every line is a complete JSON-RPC message, and never a request.
+        const reply = std.json.parseFromSliceLeaky(json_rpc.JsonRPCMessage, arena, line, .{}) catch |err| {
+            std.debug.print("invalid output line: {s}\n", .{line});
+            return err;
+        };
+        switch (reply) {
+            .request => return error.TestUnexpectedRequest,
+            .notification => {},
+            .response => |response| {
+                responses += 1;
+                switch (expected) {
+                    .response_to => |id| try std.testing.expect(response.id != null and response.id.?.eql(id)),
+                    .error_response => |id| {
+                        try std.testing.expect(response.result_or_error == .@"error");
+                        if (id) |expected_id| {
+                            try std.testing.expect(response.id != null and response.id.?.eql(expected_id));
+                        } else {
+                            try std.testing.expectEqual(null, response.id);
+                        }
+                    },
+                    .nothing => {},
+                }
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(usize, if (expected == .nothing) 0 else 1), responses);
+}
+
+/// The id an error response to an invalid message must carry: the id of an
+/// object with a `"method"` (a request) if it is a string or integer, `null`
+/// otherwise. Responses' ids belong to the server's own requests.
+fn expectedErrorId(arena: std.mem.Allocator, message: []const u8) ?json_rpc.ID {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, message, .{}) catch return null;
+    if (value != .object or value.object.get("method") == null) return null;
+    return switch (value.object.get("id") orelse return null) {
+        .integer => |number| .{ .number = number },
+        .string => |string| .{ .string = string },
+        else => null,
+    };
+}
+
+test "fuzz checkJson" {
+    try std.testing.fuzz({}, fuzzCheckJson, .{ .corpus = &fuzz_value_corpus });
+}
+
+/// Encodings of `fuzzValue` inputs, see its generator for the format.
+const fuzz_value_corpus = [_][]const u8{
+    // Nested deeper than `max_value_depth`: rejected.
+    corpusChain(corpusNull(), 250, true),
+    // Deep, but within the limit: serialized.
+    corpusChain(corpusString("ok"), 150, false),
+    corpusFloat(0x7ff8000000000000), // nan
+    smithInt(6) ++ smithInt(2) ++ corpusNull() ++ corpusFloat(0x7ff0000000000000), // [null, inf]
+    corpusString("\xff"),
+    smithInt(9) ++ smithInt(1) ++ smithSlice("\xfe") ++ corpusNull(), // {"\xfe": null}
+    smithInt(6) ++ smithInt(3) ++ corpusNull() ++ corpusFloat(@bitCast(@as(f64, 1.5))) ++ corpusString("h\xc3\xa9"),
+};
+
+fn corpusNull() []const u8 {
+    return smithInt(0);
+}
+fn corpusFloat(comptime bits: u64) []const u8 {
+    return smithInt(3) ++ smithInt(bits);
+}
+fn corpusString(comptime bytes: []const u8) []const u8 {
+    return smithInt(4) ++ smithSlice(bytes);
+}
+/// `levels` nested arrays (or objects) around `inner`.
+fn corpusChain(comptime inner: []const u8, comptime levels: u16, comptime arrays: bool) []const u8 {
+    @setEvalBranchQuota(10_000);
+    var result: []const u8 = smithInt(10) ++ inner ++ smithInt(levels);
+    for (0..levels) |_| result = result ++ smithInt(@intFromBool(arrays));
+    return result;
+}
+
+/// Generates random values, including deep nesting, non-finite floats and
+/// invalid UTF-8. Whenever `checkJson` accepts a value, serializing it inside
+/// a complete response must succeed and produce single-line JSON; whenever it
+/// rejects one, an independent walk must find a reason.
+fn fuzzCheckJson(_: void, smith: *std.testing.Smith) !void {
+    var arena_allocator: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    // Bounds the number of generated values (including nesting levels) per run.
+    var budget: usize = 1024;
+    const value = try fuzzValue(smith, arena, &budget);
+
+    const result: types.CallToolResult = .{
+        .content = &.{.initText("x")},
+        .structuredContent = .{ .value = value },
+    };
+    var facts: ValueFacts = .{};
+    valueFacts(value, 0, &facts);
+    checkJson(result) catch |err| {
+        switch (err) {
+            error.NonFiniteNumber => try std.testing.expect(facts.non_finite),
+            error.InvalidUtf8 => try std.testing.expect(facts.invalid_utf8),
+            // The result struct around the value adds one level.
+            error.TooDeeplyNested => try std.testing.expect(facts.depth + 1 > max_value_depth),
+            error.NewlineInRawJson => return error.TestUnexpectedResult, // no raw JSON is generated
+        }
+        return;
+    };
+    try std.testing.expect(!facts.non_finite and !facts.invalid_utf8 and facts.depth + 1 <= max_value_depth);
+
+    const response: json_rpc.TypedJsonRPCResponse(types.CallToolResult) = .{
+        .id = .{ .number = 1 },
+        .result_or_error = .{ .result = result },
+    };
+    const json = try std.json.Stringify.valueAlloc(arena, response, stringify_options);
+    try std.testing.expectEqual(null, std.mem.findScalar(u8, json, '\n'));
+    try std.testing.expect(try std.json.validate(arena, json));
+}
+
+const ValueFacts = struct {
+    /// Maximum number of nested arrays and objects.
+    depth: usize = 0,
+    non_finite: bool = false,
+    invalid_utf8: bool = false,
+};
+
+fn valueFacts(value: std.json.Value, depth: usize, facts: *ValueFacts) void {
+    facts.depth = @max(facts.depth, depth);
+    switch (value) {
+        .float => |float| facts.non_finite = facts.non_finite or !std.math.isFinite(float),
+        .string, .number_string => |string| facts.invalid_utf8 = facts.invalid_utf8 or !std.unicode.utf8ValidateSlice(string),
+        .array => |array| {
+            facts.depth = @max(facts.depth, depth + 1);
+            for (array.items) |item| valueFacts(item, depth + 1, facts);
+        },
+        .object => |object| {
+            facts.depth = @max(facts.depth, depth + 1);
+            for (object.keys(), object.values()) |key, item| {
+                facts.invalid_utf8 = facts.invalid_utf8 or !std.unicode.utf8ValidateSlice(key);
+                valueFacts(item, depth + 1, facts);
+            }
+        },
+        .null, .bool, .integer => {},
+    }
+}
+
+/// Input format (as read from `std.testing.Smith`): a kind (`u8`, 0-10),
+/// followed by the kind's data, e.g. 8 bytes of float bits for kind 3 or a
+/// count and that many values for arrays (6-8) and objects (9).
+fn fuzzValue(smith: *std.testing.Smith, arena: std.mem.Allocator, budget: *usize) !std.json.Value {
+    if (budget.* == 0) return .null;
+    budget.* -= 1;
+    return switch (smith.valueRangeAtMost(u8, 0, 10)) {
+        0 => .null,
+        1 => .{ .bool = smith.value(bool) },
+        2 => .{ .integer = smith.value(i64) },
+        // Any bit pattern, including inf and nan.
+        3 => .{ .float = @bitCast(smith.value(u64)) },
+        4, 5 => blk: {
+            const buffer = try arena.alloc(u8, 16);
+            break :blk .{ .string = buffer[0..smith.slice(buffer)] };
+        },
+        // Arrays are more likely, so that deep nesting is reached.
+        6, 7, 8 => blk: {
+            var array: std.json.Array = .init(arena);
+            for (0..smith.valueRangeAtMost(u8, 0, 3)) |_| try array.append(try fuzzValue(smith, arena, budget));
+            break :blk .{ .array = array };
+        },
+        // A chain of nested arrays and objects around the limits of `checkJson`
+        // and `std.json`.
+        10 => blk: {
+            var value = try fuzzValue(smith, arena, budget);
+            const levels = @min(smith.valueRangeAtMost(u16, 0, 400), budget.*);
+            budget.* -= levels;
+            for (0..levels) |_| {
+                if (smith.value(bool)) {
+                    var array: std.json.Array = .init(arena);
+                    try array.append(value);
+                    value = .{ .array = array };
+                } else {
+                    var object: std.json.ObjectMap = .empty;
+                    try object.put(arena, "k", value);
+                    value = .{ .object = object };
+                }
+            }
+            break :blk value;
+        },
+        else => blk: {
+            var object: std.json.ObjectMap = .empty;
+            for (0..smith.valueRangeAtMost(u8, 0, 3)) |_| {
+                const key = try arena.alloc(u8, 8);
+                try object.put(arena, key[0..smith.slice(key)], try fuzzValue(smith, arena, budget));
+            }
+            break :blk .{ .object = object };
+        },
+    };
 }
