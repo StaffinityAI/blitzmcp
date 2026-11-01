@@ -25,7 +25,11 @@ const Server = mcp.Server(Handler, .{
     .name = "blitz-example",
     .title = "Blitz MCP Example",
     .version = "0.1.0",
-    .instructions = "A demo server with a counter, a word counter and a greeting prompt.",
+    .instructions = "A demo server with a counter, a word counter, a slow countdown, a summarizer and a greeting prompt.",
+    // Each request is handled in its own task: slow tools do not block other
+    // requests, they can be canceled, and handlers can send requests to the
+    // client (see `summarize`). Handlers must be thread-safe.
+    .concurrency = .concurrent,
     .tools = .{
         .{
             .name = "increment",
@@ -39,6 +43,16 @@ const Server = mcp.Server(Handler, .{
             .annotations = .{ .readOnlyHint = true, .openWorldHint = false },
             .call = Handler.countWords,
         },
+        .{
+            .name = "countdown",
+            .description = "Counts down from a number, one step every 100 ms, reporting progress. Can be canceled.",
+            .call = Handler.countdown,
+        },
+        .{
+            .name = "summarize",
+            .description = "Asks the client's LLM (via sampling) to summarize a text.",
+            .call = Handler.summarize,
+        },
     },
     .prompts = .{
         .{
@@ -50,6 +64,8 @@ const Server = mcp.Server(Handler, .{
 });
 
 const Handler = struct {
+    /// Requests are handled concurrently, so the counter is protected by a mutex.
+    mutex: std.Io.Mutex = .init,
     counter: i64 = 0,
 
     const IncrementArgs = struct {
@@ -60,6 +76,8 @@ const Handler = struct {
 
     // Returning a struct produces both `structuredContent` and an `outputSchema`.
     fn increment(handler: *Handler, ctx: *mcp.Context, args: IncrementArgs) !struct { value: i64 } {
+        try handler.mutex.lock(ctx.io);
+        defer handler.mutex.unlock(ctx.io);
         handler.counter = std.math.add(i64, handler.counter, args.by) catch
             return ctx.fail(error.Overflow, "The counter would overflow", .{});
         return .{ .value = handler.counter };
@@ -84,6 +102,45 @@ const Handler = struct {
         return std.fmt.allocPrint(ctx.arena, "{d}", .{count});
     }
 
+    const CountdownArgs = struct {
+        from: u8 = 5,
+
+        pub const descriptions = .{ .from = "The number to count down from." };
+    };
+
+    fn countdown(ctx: *mcp.Context, args: CountdownArgs) ![]const u8 {
+        var remaining = args.from;
+        while (remaining > 0) : (remaining -= 1) {
+            try ctx.sendProgress(@floatFromInt(args.from - remaining), @floatFromInt(args.from), null);
+            // Returns `error.Canceled` when the client cancels the request.
+            try ctx.io.sleep(.fromMilliseconds(100), .awake);
+        }
+        return "liftoff";
+    }
+
+    const SummarizeArgs = struct {
+        text: []const u8,
+
+        pub const descriptions = .{ .text = "The text to summarize." };
+    };
+
+    fn summarize(ctx: *mcp.Context, args: SummarizeArgs) ![]const u8 {
+        const prompt = try std.fmt.allocPrint(ctx.arena, "Summarize in one sentence: {s}", .{args.text});
+        // Waits for the client's response; fails if the client does not support sampling.
+        const result = ctx.request("sampling/createMessage", .{
+            .messages = &.{.{ .role = .user, .content = .initText(prompt) }},
+            .maxTokens = 100,
+        }) catch |err| switch (err) {
+            error.CapabilityMissing => return ctx.fail(err, "The client does not support sampling", .{}),
+            error.RequestFailed => return ctx.fail(err, "Sampling failed: {s}", .{ctx.response_error.?.message}),
+            else => |e| return e,
+        };
+        return switch (result.content) {
+            .text => |text| text.text,
+            else => ctx.fail(error.UnexpectedContent, "The client returned non-text content", .{}),
+        };
+    }
+
     const GreetArgs = struct {
         name: []const u8,
         style: ?[]const u8 = null,
@@ -105,8 +162,10 @@ const Handler = struct {
         } };
     }
 
-    pub fn @"resources/read"(handler: *Handler, arena: std.mem.Allocator, params: mcp.types.ReadResourceRequestParams) !mcp.types.ReadResourceResult {
+    pub fn @"resources/read"(handler: *Handler, ctx: *mcp.Context, arena: std.mem.Allocator, params: mcp.types.ReadResourceRequestParams) !mcp.types.ReadResourceResult {
         if (!std.mem.eql(u8, params.uri, "counter://value")) return error.ResourceNotFound;
+        try handler.mutex.lock(ctx.io);
+        defer handler.mutex.unlock(ctx.io);
         const contents = try arena.alloc(mcp.types.ResourceContents, 1);
         contents[0] = .{ .text = .{
             .uri = params.uri,

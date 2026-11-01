@@ -14,6 +14,7 @@ const std = @import("std");
 
 pub const json_rpc = @import("json_rpc.zig");
 pub const Transport = @import("Transport.zig");
+pub const Connection = @import("Connection.zig");
 pub const types = @import("types.zig");
 pub const schema = @import("schema.zig");
 
@@ -29,6 +30,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = json_rpc;
     _ = Transport;
+    _ = Connection;
     _ = types;
     _ = schema;
     _ = server;

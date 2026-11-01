@@ -28,6 +28,7 @@ const json_rpc = @import("json_rpc.zig");
 const types = @import("types.zig");
 const schema = @import("schema.zig");
 const Transport = @import("Transport.zig");
+const Connection = @import("Connection.zig");
 
 /// Problems a client can cause are never logged at `err` level: client input
 /// must not be able to make the server look broken (and `err` logs fail tests).
@@ -64,17 +65,21 @@ pub const Context = struct {
     /// Freed after the current message has been handled.
     arena: std.mem.Allocator,
     transport: *Transport,
+    connection: *Connection,
     /// `null` when handling a notification.
     request_id: ?json_rpc.ID,
     /// Set if the client requested progress notifications for this request.
     progress_token: ?types.ProgressToken,
-    /// The minimum log level requested by the client via `logging/setLevel`.
-    /// `null` if the client has not set a level.
-    log_level: ?types.LoggingLevel,
+    /// Set when the request is handled concurrently (in its own task, while
+    /// the server keeps reading messages) and can be canceled.
+    in_flight: ?*Connection.InFlight = null,
     /// Set by `fail`. Replaces the error name in the reported message if the
     /// handler returns `error_message_for`.
     error_message: ?[]const u8 = null,
     error_message_for: ?anyerror = null,
+    /// Set when `request` fails with `error.RequestFailed`: the error the
+    /// client responded with.
+    response_error: ?json_rpc.JsonRPCMessage.Response.Error = null,
 
     pub const SendError = Transport.WriteError || std.mem.Allocator.Error || JsonValueError;
 
@@ -98,7 +103,7 @@ pub const Context = struct {
     /// Sends a `notifications/message` notification if `level` is at least the
     /// level requested by the client. `data` may be any JSON serializable value.
     pub fn log(ctx: *Context, level: types.LoggingLevel, logger: ?[]const u8, data: anytype) SendError!void {
-        if (ctx.log_level) |min_level| {
+        if (ctx.connection.logLevel()) |min_level| {
             if (@backingInt(level) < @backingInt(min_level)) return;
         }
         const Params = struct {
@@ -112,6 +117,114 @@ pub const Context = struct {
     /// Like `log` with a formatted string as `data`.
     pub fn logf(ctx: *Context, level: types.LoggingLevel, comptime fmt: []const u8, args: anytype) SendError!void {
         try ctx.log(level, null, try std.fmt.allocPrint(ctx.arena, fmt, args));
+    }
+
+    /// Whether the client canceled the request (`notifications/cancelled`).
+    /// The handler also receives `error.Canceled` from its next `Io` call.
+    pub fn isCanceled(ctx: *const Context) bool {
+        const in_flight = ctx.in_flight orelse return false;
+        return in_flight.canceled.load(.acquire);
+    }
+
+    pub const RequestError = SendError || error{
+        /// Requests to the client need `.concurrency = .concurrent`: the
+        /// server must keep reading messages while the handler waits.
+        RequestsUnavailable,
+        /// The client did not declare the capability the method needs.
+        CapabilityMissing,
+        /// The client went away before responding.
+        ConnectionClosed,
+        /// The client responded with an error, see `response_error`.
+        RequestFailed,
+        /// The response does not match the method's result type.
+        InvalidResponse,
+        Canceled,
+    };
+
+    /// Sends a request to the client (see `types.server_requests`) and waits
+    /// for its response, e.g.
+    /// `try ctx.request("sampling/createMessage", .{ .messages = ..., .maxTokens = 100 })`.
+    ///
+    /// If the handler is canceled while waiting, the client is sent
+    /// `notifications/cancelled` for the request and `error.Canceled` is
+    /// returned.
+    pub fn request(
+        ctx: *Context,
+        comptime method: []const u8,
+        params: @field(types.server_requests, method).Params,
+    ) RequestError!@field(types.server_requests, method).Result {
+        const M = @field(types.server_requests, method);
+        const connection = ctx.connection;
+        // The response is read by the task that reads all messages; waiting
+        // for it on that task would deadlock.
+        if (ctx.in_flight == null) return error.RequestsUnavailable;
+        ctx.response_error = null;
+
+        const capabilities = connection.client_capabilities;
+        const supported = if (comptime std.mem.eql(u8, method, "sampling/createMessage"))
+            capabilities.sampling
+        else if (comptime std.mem.eql(u8, method, "elicitation/create"))
+            capabilities.elicitation
+        else if (comptime std.mem.eql(u8, method, "roots/list"))
+            capabilities.roots
+        else
+            true;
+        if (!supported) return error.CapabilityMissing;
+        if (M.Params != void) try checkJson(params);
+
+        var pending: Connection.Pending = .{};
+        const number = try connection.addPending(ctx.io, &pending);
+        defer {
+            // Remove first, so that no response can be delivered after it was freed.
+            connection.removePending(ctx.io, number);
+            if (pending.response) |response| connection.gpa.free(response);
+        }
+        var id_buffer: [Connection.request_id_prefix.len + 20]u8 = undefined;
+        const id = Connection.requestId(&id_buffer, number);
+
+        try ctx.transport.writeRequest(ctx.io, ctx.arena, id, method, M.Params, params, stringify_options);
+        pending.done.wait(ctx.io) catch |err| switch (err) {
+            error.Canceled => {
+                ctx.sendNotification("notifications/cancelled", types.CancelledNotificationParams, .{
+                    .requestId = id,
+                    .reason = "The request was canceled by the server",
+                }) catch {};
+                return error.Canceled;
+            },
+        };
+
+        if (pending.out_of_memory) return error.OutOfMemory;
+        const json_message = pending.response orelse return error.ConnectionClosed;
+        const message = std.json.parseFromSliceLeaky(json_rpc.JsonRPCMessage, ctx.arena, json_message, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always, // `json_message` is freed before returning
+        }) catch return error.InvalidResponse;
+        const response = switch (message) {
+            .response => |response| response,
+            .request, .notification => return error.InvalidResponse,
+        };
+        switch (response.result_or_error) {
+            .@"error" => |err| {
+                ctx.response_error = err;
+                return error.RequestFailed;
+            },
+            .result => |result| return std.json.parseFromValueLeaky(M.Result, ctx.arena, result orelse .null, .{
+                .ignore_unknown_fields = true,
+            }) catch error.InvalidResponse,
+        }
+    }
+
+    /// Writes the response to the current request. The request is unregistered
+    /// first, so that the client can reuse its id and slot right away.
+    fn respond(ctx: *Context, comptime Result: type, result: Result) (Transport.WriteError || std.mem.Allocator.Error)!void {
+        if (ctx.in_flight) |in_flight| ctx.connection.removeInFlight(ctx.io, in_flight);
+        try ctx.transport.writeResponse(ctx.io, ctx.arena, ctx.request_id, Result, result, stringify_options);
+    }
+
+    /// Like `respond`, with an error response.
+    fn respondError(ctx: *Context, err: json_rpc.JsonRPCMessage.Response.Error) (Transport.WriteError || std.mem.Allocator.Error)!void {
+        if (ctx.in_flight) |in_flight| ctx.connection.removeInFlight(ctx.io, in_flight);
+        try ctx.transport.writeErrorResponse(ctx.io, ctx.arena, ctx.request_id, err, stringify_options);
     }
 
     /// Returns `err` and reports the formatted message instead of the error
@@ -139,6 +252,19 @@ pub const Context = struct {
 /// - `.title: []const u8`
 /// - `.description: []const u8`
 /// - `.instructions: []const u8`
+/// - `.concurrency`: `.serial` (default) handles one message at a time.
+///   `.concurrent` handles each request in its own `Io` task, so slow
+///   requests do not block others, `notifications/cancelled` cancels a request
+///   (its handler receives `error.Canceled` from its next `Io` call) and
+///   `Context.request` can wait for responses from the client. Handlers must
+///   then be thread-safe. Requires an `Io` implementation with concurrency
+///   (e.g. `std.Io.Threaded`), otherwise requests are handled serially.
+/// - `.max_concurrent_requests: usize` (default 64): further requests are
+///   rejected with a JSON-RPC error until others finish. Each request uses two
+///   `Io` tasks (one owns the other so that it can be canceled); requests are
+///   also rejected when the `Io` runs out of concurrency.
+/// - `.shutdown_timeout_ms: u64` (default 5000): when the input ends, how long
+///   requests in flight may still run before they are canceled.
 /// - `.tools`: a tuple of tool definitions:
 ///   - `.name: []const u8` (required)
 ///   - `.call: fn` (required) — the arguments struct is inferred from the
@@ -170,10 +296,13 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
 
     return struct {
         handler: *Handler,
-        /// The minimum log level requested by the client via `logging/setLevel`.
-        log_level: ?types.LoggingLevel = null,
+        connection: Connection = .{},
 
         const Self = @This();
+
+        pub const concurrency: Connection.Mode = if (@hasField(Config, "concurrency")) config.concurrency else .serial;
+        pub const max_concurrent_requests: usize = if (@hasField(Config, "max_concurrent_requests")) config.max_concurrent_requests else 64;
+        pub const shutdown_timeout_ms: u64 = if (@hasField(Config, "shutdown_timeout_ms")) config.shutdown_timeout_ms else 5000;
 
         pub const server_info: types.Implementation = .{
             .name = config.name,
@@ -255,8 +384,20 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
         }
 
         /// Reads and handles messages until the transport reaches the end of
-        /// the stream (e.g. stdin has been closed).
+        /// the stream (e.g. stdin has been closed). With `.concurrency =
+        /// .concurrent`, waits for the requests in flight before returning.
+        /// When it returns, the connection is reset, so that `run` can be
+        /// called again for another session.
         pub fn run(self: *Self, io: std.Io, gpa: std.mem.Allocator, transport: *Transport) !void {
+            self.connection.gpa = gpa;
+            defer self.connection.reset();
+            return switch (concurrency) {
+                .serial => self.runSerial(io, gpa, transport),
+                .concurrent => self.runConcurrent(io, gpa, transport),
+            };
+        }
+
+        fn runSerial(self: *Self, io: std.Io, gpa: std.mem.Allocator, transport: *Transport) !void {
             while (true) {
                 const json_message = transport.readJsonMessage(io, gpa) catch |err| switch (err) {
                     error.EndOfStream => return,
@@ -279,6 +420,11 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
         ///
         /// Running out of memory while handling a request is reported to the
         /// client as an `internal_error` instead of being returned.
+        ///
+        /// Requests other than `initialize` and `ping` are rejected until this
+        /// `Server` has answered `initialize` (keep one `Server` per session,
+        /// or call `connection.markInitialized` for a session initialized
+        /// elsewhere).
         pub fn handleMessage(
             self: *Self,
             io: std.Io,
@@ -286,11 +432,17 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
             transport: *Transport,
             json_message: []const u8,
         ) Transport.WriteError!void {
+            self.connection.gpa = gpa;
             var arena_allocator: std.heap.ArenaAllocator = .init(gpa);
             defer arena_allocator.deinit();
 
             var kind: MessageKind = .unknown;
-            self.handleMessageInner(io, arena_allocator.allocator(), transport, json_message, &kind) catch |err| switch (err) {
+            _ = self.handleMessageInner(io, arena_allocator.allocator(), transport, json_message, &kind, false) catch |err|
+                return handleOutOfMemory(io, transport, kind, err);
+        }
+
+        fn handleOutOfMemory(io: std.Io, transport: *Transport, kind: MessageKind, err: (Transport.WriteError || std.mem.Allocator.Error)) Transport.WriteError!void {
+            switch (err) {
                 error.OutOfMemory => {
                     log.warn("ran out of memory while handling a message", .{});
                     switch (kind) {
@@ -302,8 +454,14 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                     }
                 },
                 else => |e| return e,
-            };
+            }
         }
+
+        const Outcome = union(enum) {
+            handled,
+            /// The request should be handled concurrently.
+            spawn: json_rpc.JsonRPCMessage.Request,
+        };
 
         fn handleMessageInner(
             self: *Self,
@@ -312,11 +470,14 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
             transport: *Transport,
             json_message: []const u8,
             kind: *MessageKind,
-        ) (Transport.WriteError || std.mem.Allocator.Error)!void {
+            /// Return requests that should be handled concurrently instead of handling them.
+            allow_spawn: bool,
+        ) (Transport.WriteError || std.mem.Allocator.Error)!Outcome {
             const value = std.json.parseFromSliceLeaky(std.json.Value, arena, json_message, .{}) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 log.debug("failed to parse message: {}", .{err});
-                return transport.writeErrorResponse(io, arena, null, .{ .code = .parse_error, .message = "Parse error" }, stringify_options);
+                try transport.writeErrorResponse(io, arena, null, .{ .code = .parse_error, .message = "Parse error" }, stringify_options);
+                return .handled;
             };
             kind.* = classify(value);
 
@@ -327,43 +488,220 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                     .request => |id| id,
                     .unknown, .other => null,
                 };
-                return transport.writeErrorResponse(io, arena, id, .{ .code = .invalid_request, .message = "Invalid Request" }, stringify_options);
+                try transport.writeErrorResponse(io, arena, id, .{ .code = .invalid_request, .message = "Invalid Request" }, stringify_options);
+                return .handled;
             };
 
             var ctx: Context = .{
                 .io = io,
                 .arena = arena,
                 .transport = transport,
+                .connection = &self.connection,
                 .request_id = null,
                 .progress_token = null,
-                .log_level = self.log_level,
             };
 
             switch (message) {
                 .request => |request| {
+                    if (allow_spawn and !handledInline(request.method) and self.connection.isInitialized()) {
+                        return .{ .spawn = request };
+                    }
                     ctx.request_id = request.id;
                     ctx.progress_token = extractProgressToken(request.params);
                     try self.handleRequest(&ctx, request);
                 },
                 .notification => |notification| self.handleNotification(&ctx, notification),
                 .response => |response| {
-                    if (@hasDecl(Handler, "onResponse")) {
+                    // A response to a request sent with `Context.request`?
+                    const delivered = if (response.id) |id| self.connection.deliverResponse(io, id, json_message) else false;
+                    if (!delivered and @hasDecl(Handler, "onResponse")) {
                         toErrorUnion(callInjected(self.handler, &ctx, Handler.onResponse, response)) catch |err| {
                             log.warn("failed to handle response: {}", .{err});
                         };
                     }
                 },
             }
+            return .handled;
+        }
+
+        /// Methods that change how later requests are handled (or check
+        /// responsiveness) are handled by the reading task, in order.
+        fn handledInline(method: []const u8) bool {
+            return allowedBeforeInitialize(method) or std.mem.eql(u8, method, "logging/setLevel");
+        }
+
+        fn allowedBeforeInitialize(method: []const u8) bool {
+            return std.mem.eql(u8, method, "initialize") or std.mem.eql(u8, method, "ping");
+        }
+
+        fn runConcurrent(self: *Self, io: std.Io, gpa: std.mem.Allocator, transport: *Transport) !void {
+            // Without concurrency, handle messages one after another; requests
+            // to the client are then unavailable instead of deadlocking.
+            var probe = io.concurrent(noop, .{}) catch {
+                log.warn("the Io implementation has no concurrency, handling requests serially", .{});
+                return self.runSerial(io, gpa, transport);
+            };
+            probe.await(io);
+
+            // Responses and notifications are written by many tasks.
+            var thread_safe: Transport.ThreadSafe(.{ .thread_safe_read = false, .thread_safe_write = true }) = .init(transport);
+            const out = &thread_safe.transport;
+
+            var group: std.Io.Group = .init;
+            defer {
+                // Requests waiting for a response from the client fail now.
+                self.connection.close(io);
+                // Give requests in flight time to finish, then cancel them.
+                self.connection.idle.waitTimeout(io, .{ .duration = .{
+                    .raw = .fromMilliseconds(@intCast(shutdown_timeout_ms)),
+                    .clock = .awake,
+                } }) catch {};
+                group.cancel(io);
+            }
+
+            while (true) {
+                const json_message = out.readJsonMessage(io, gpa) catch |err| switch (err) {
+                    error.EndOfStream => return,
+                    error.MessageTooLong => {
+                        log.warn("skipped a message that exceeds the transport's size limit", .{});
+                        try writeFallbackError(io, out, null, .invalid_request, "Message too long");
+                        continue;
+                    },
+                    else => |e| return e,
+                };
+                try self.dispatch(io, gpa, out, json_message, &group);
+            }
+        }
+
+        fn noop() void {}
+
+        /// A request that is handled concurrently. Owns its message.
+        const RequestTask = struct {
+            server: *Self,
+            io: std.Io,
+            gpa: std.mem.Allocator,
+            transport: *Transport,
+            json_message: []u8,
+            arena_allocator: std.heap.ArenaAllocator,
+            request: json_rpc.JsonRPCMessage.Request,
+            /// Its id points into the request, i.e. the arena or the message.
+            in_flight: Connection.InFlight,
+
+            fn destroy(task: *RequestTask) void {
+                task.server.connection.removeInFlight(task.io, &task.in_flight);
+                task.arena_allocator.deinit();
+                task.gpa.free(task.json_message);
+                task.gpa.destroy(task);
+            }
+        };
+
+        /// Handles notifications, responses and the methods in `handledInline`
+        /// right away and spawns a task for other requests. Takes ownership of
+        /// `json_message`.
+        fn dispatch(self: *Self, io: std.Io, gpa: std.mem.Allocator, transport: *Transport, json_message: []u8, group: *std.Io.Group) Transport.WriteError!void {
+            var arena_allocator: std.heap.ArenaAllocator = .init(gpa);
+            var handed_off = false;
+            defer if (!handed_off) {
+                arena_allocator.deinit();
+                gpa.free(json_message);
+            };
+
+            var kind: MessageKind = .unknown;
+            const outcome = self.handleMessageInner(io, arena_allocator.allocator(), transport, json_message, &kind, true) catch |err|
+                return handleOutOfMemory(io, transport, kind, err);
+            const request = switch (outcome) {
+                .handled => return,
+                .spawn => |request| request,
+            };
+
+            const task = gpa.create(RequestTask) catch return handleOutOfMemory(io, transport, kind, error.OutOfMemory);
+            // The parsed request points into the arena and the message, which
+            // now belong to the task. (Moving the arena is fine: only its
+            // buffers are referenced.)
+            task.* = .{
+                .server = self,
+                .io = io,
+                .gpa = gpa,
+                .transport = transport,
+                .json_message = json_message,
+                .arena_allocator = arena_allocator,
+                .request = request,
+                .in_flight = .{ .id = request.id },
+            };
+            handed_off = true;
+            var spawned = false;
+            defer if (!spawned) task.destroy();
+
+            self.connection.addInFlight(io, &task.in_flight, max_concurrent_requests) catch |err| switch (err) {
+                error.OutOfMemory => return handleOutOfMemory(io, transport, kind, error.OutOfMemory),
+                error.DuplicateId => return writeFallbackError(io, transport, request.id, .invalid_request, "A request with this id is already in progress"),
+                error.TooManyRequests => return writeFallbackError(io, transport, request.id, server_busy, "Too many concurrent requests"),
+            };
+            group.concurrent(io, requestTask, .{task}) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => return writeFallbackError(io, transport, request.id, server_busy, "Too many concurrent requests"),
+            };
+            spawned = true;
+        }
+
+        /// Owns the handler's task, so that it can be canceled.
+        fn requestTask(task: *RequestTask) void {
+            const io = task.io;
+            defer task.destroy();
+            var future = io.concurrent(runRequest, .{task}) catch {
+                writeFallbackError(io, task.transport, task.request.id, server_busy, "Too many concurrent requests") catch |err| {
+                    log.warn("failed to write a response: {}", .{err});
+                };
+                return;
+            };
+            // Set when the handler finished or the client canceled the request.
+            task.in_flight.done.wait(io) catch {
+                // The server is shutting down.
+                future.cancel(io);
+                return;
+            };
+            if (task.in_flight.canceled.load(.acquire)) future.cancel(io) else future.await(io);
+        }
+
+        fn runRequest(task: *RequestTask) void {
+            const io = task.io;
+            defer task.in_flight.done.set(io);
+            var ctx: Context = .{
+                .io = io,
+                .arena = task.arena_allocator.allocator(),
+                .transport = task.transport,
+                .connection = &task.server.connection,
+                .request_id = task.request.id,
+                .progress_token = extractProgressToken(task.request.params),
+                .in_flight = &task.in_flight,
+            };
+            task.server.handleRequest(&ctx, task.request) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    task.server.connection.removeInFlight(io, &task.in_flight);
+                    handleOutOfMemory(io, task.transport, .{ .request = task.request.id }, error.OutOfMemory) catch |e| {
+                        log.warn("failed to write a response: {}", .{e});
+                    };
+                },
+                else => log.warn("failed to write a response: {}", .{err}),
+            };
         }
 
         fn handleRequest(self: *Self, ctx: *Context, request: json_rpc.JsonRPCMessage.Request) !void {
+            const is_initialize = std.mem.eql(u8, request.method, "initialize");
+            if (is_initialize and !self.connection.beginInitialize()) {
+                return ctx.respondError(.{ .code = .invalid_request, .message = "Server already initialized" });
+            }
+            // No effect once `initialize` succeeded.
+            defer if (is_initialize) self.connection.abortInitialize();
+            if (!is_initialize and !self.connection.isInitialized() and !allowedBeforeInitialize(request.method)) {
+                return ctx.respondError(.{ .code = .invalid_request, .message = "Server not initialized" });
+            }
             inline for (comptime std.meta.declarations(types.client_requests)) |method| {
                 if ((comptime isImplemented(method)) and std.mem.eql(u8, request.method, method)) {
                     return self.handleKnownRequest(method, ctx, request);
                 }
             }
             const message = try std.fmt.allocPrint(ctx.arena, "Method not found: {s}", .{request.method});
-            try ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{ .code = .method_not_found, .message = message }, stringify_options);
+            try ctx.respondError(.{ .code = .method_not_found, .message = message });
         }
 
         fn handleKnownRequest(self: *Self, comptime method: []const u8, ctx: *Context, request: json_rpc.JsonRPCMessage.Request) !void {
@@ -376,7 +714,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 .{ .ignore_unknown_fields = true },
             ) catch |err| {
                 const message = try std.fmt.allocPrint(ctx.arena, "Invalid params: {s}", .{@errorName(err)});
-                return ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{ .code = .invalid_params, .message = message }, stringify_options);
+                return ctx.respondError(.{ .code = .invalid_params, .message = message });
             };
 
             const result_or_error = if (@hasDecl(Handler, method)) blk: {
@@ -392,20 +730,24 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 const result_or_error = toErrorUnion(result);
                 // Keep the server state in sync when the Handler overrides a stateful method.
                 if (comptime std.mem.eql(u8, method, "logging/setLevel")) {
-                    if (result_or_error) |_| self.log_level = params.level else |_| {}
+                    if (result_or_error) |_| self.connection.setLogLevel(params.level) else |_| {}
                 }
                 break :blk result_or_error;
             } else self.builtin(method, ctx, params);
 
+            // Requests canceled by the client are not answered.
+            if (ctx.isCanceled()) return;
             if (result_or_error) |result| {
                 checkJson(result) catch |err| {
                     log.warn("invalid result for '{s}' request: {s}", .{ method, jsonValueErrorMessage(err) });
-                    return ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{
+                    return ctx.respondError(.{
                         .code = .internal_error,
                         .message = try std.fmt.allocPrint(ctx.arena, "Invalid result: {s}", .{jsonValueErrorMessage(err)}),
-                    }, stringify_options);
+                    });
                 };
-                try ctx.transport.writeResponse(ctx.io, ctx.arena, request.id, M.Result, result, stringify_options);
+                try ctx.respond(M.Result, result);
+                // Only once the client got a successful response.
+                if (comptime std.mem.eql(u8, method, "initialize")) self.connection.markInitialized(params);
             } else |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 const code = errorCode(err);
@@ -414,10 +756,10 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 } else {
                     log.debug("failed to handle '{s}' request: {}", .{ method, err });
                 }
-                try ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{
+                try ctx.respondError(.{
                     .code = code,
                     .message = try ctx.errorMessage(err),
-                }, stringify_options);
+                });
             }
         }
 
@@ -440,7 +782,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
             if (comptime std.mem.eql(u8, method, "initialize")) return defaultInitializeResult(params);
             if (comptime std.mem.eql(u8, method, "ping")) return .{};
             if (comptime std.mem.eql(u8, method, "logging/setLevel")) {
-                self.log_level = params.level;
+                self.connection.setLogLevel(params.level);
                 return .{};
             }
             if (comptime std.mem.eql(u8, method, "tools/list")) return .{ .tools = tools };
@@ -459,7 +801,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
             return ctx.fail(error.InvalidParams, "Unknown tool: {s}", .{params.name});
         }
 
-        fn invokeTool(self: *Self, comptime def: anytype, ctx: *Context, arguments: ?std.json.Value) std.mem.Allocator.Error!types.CallToolResult {
+        fn invokeTool(self: *Self, comptime def: anytype, ctx: *Context, arguments: ?std.json.Value) (std.mem.Allocator.Error || error{Canceled})!types.CallToolResult {
             const Args = ArgsType(Handler, def);
             const args: Args = if (Args == void) {} else std.json.parseFromValueLeaky(
                 Args,
@@ -472,6 +814,8 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
 
             const result = toErrorUnion(callInjected(self.handler, ctx, def.call, args)) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
+                // Not answered at all, see `handleKnownRequest`.
+                if (ctx.isCanceled()) return error.Canceled;
                 return toolError(ctx.arena, "{s}", .{try ctx.errorMessage(err)});
             };
             checkJson(result) catch |err| return toolError(ctx.arena, "Invalid tool result: {s}", .{jsonValueErrorMessage(err)});
@@ -498,6 +842,13 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
         }
 
         fn handleNotification(self: *Self, ctx: *Context, notification: json_rpc.JsonRPCMessage.Notification) void {
+            if (std.mem.eql(u8, notification.method, "notifications/cancelled")) {
+                if (std.json.parseFromValueLeaky(types.CancelledNotificationParams, ctx.arena, paramsOrEmpty(notification.params), .{
+                    .ignore_unknown_fields = true,
+                })) |params| {
+                    if (params.requestId) |id| self.connection.cancelInFlight(ctx.io, id);
+                } else |_| {}
+            }
             inline for (comptime std.meta.declarations(types.client_notifications)) |method| {
                 if (@hasDecl(Handler, method) and std.mem.eql(u8, notification.method, method)) {
                     const M = @field(types.client_notifications, method);
@@ -700,6 +1051,10 @@ test checkJson {
     try object.put(std.testing.allocator, "k", .{ .float = std.math.inf(f64) });
     try std.testing.expectError(error.NonFiniteNumber, checkJson(std.json.Value{ .object = object }));
 }
+
+/// The JSON-RPC error code for requests that are rejected because the server
+/// is at capacity.
+const server_busy: json_rpc.JsonRPCMessage.Response.Error.Code = @fromBackingInt(-32000);
 
 /// What is known about a message, used to decide whether it can be answered.
 const MessageKind = union(enum) {
@@ -1055,6 +1410,11 @@ const TestServer = Server(TestHandler, .{
     },
 });
 
+/// Initializes the connection for tests that do not send `initialize`.
+fn testInitialize(connection: *Connection) void {
+    connection.markInitialized(.{ .protocolVersion = types.latest_protocol_version, .capabilities = .{}, .clientInfo = .{ .name = "test", .version = "0" } });
+}
+
 fn expectExchange(handler: *TestHandler, input: []const u8, expected_output: []const u8) !void {
     try expectServerExchange(TestServer, handler, input, expected_output);
 }
@@ -1066,6 +1426,7 @@ fn expectServerExchange(comptime S: type, handler: anytype, input: []const u8, e
 
     var stream: Transport.Stream = .init(&reader, &aw.writer);
     var server: S = .init(handler);
+    testInitialize(&server.connection);
     try server.run(std.testing.io, std.testing.allocator, &stream.transport);
 
     try std.testing.expectEqualStrings(expected_output, aw.written());
@@ -1073,16 +1434,27 @@ fn expectServerExchange(comptime S: type, handler: anytype, input: []const u8, e
 
 test "initialize" {
     var handler: TestHandler = .{};
-    try expectExchange(&handler,
+    var reader: std.Io.Reader = .fixed(
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}
         \\{"jsonrpc":"2.0","method":"notifications/initialized"}
-        \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"1999-01-01","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}
-        \\
-    ,
-        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"logging":{},"prompts":{},"resources":{},"tools":{}},"serverInfo":{"name":"test-server","version":"1.2.3"},"instructions":"Use the tools."}}
-        \\{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-11-25","capabilities":{"logging":{},"prompts":{},"resources":{},"tools":{}},"serverInfo":{"name":"test-server","version":"1.2.3"},"instructions":"Use the tools."}}
+        \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}
         \\
     );
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var stream: Transport.Stream = .init(&reader, &aw.writer);
+    var server: TestServer = .init(&handler);
+    try server.run(std.testing.io, std.testing.allocator, &stream.transport);
+
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"logging":{},"prompts":{},"resources":{},"tools":{}},"serverInfo":{"name":"test-server","version":"1.2.3"},"instructions":"Use the tools."}}
+        \\{"jsonrpc":"2.0","id":2,"error":{"code":-32600,"message":"Server already initialized"}}
+        \\
+    , aw.written());
+
+    // Unsupported versions are answered with the latest supported one.
+    try std.testing.expectEqualStrings("2025-11-25", TestServer.negotiateProtocolVersion("1999-01-01"));
+    try std.testing.expectEqualStrings("2024-11-05", TestServer.negotiateProtocolVersion("2024-11-05"));
 }
 
 test "tools/list" {
@@ -1408,8 +1780,413 @@ test "deeply nested and raw results are rejected instead of crashing" {
     defer aw.deinit();
     var stream: Transport.Stream = .init(&reader, &aw.writer);
     var server: S = .init(&handler);
+    testInitialize(&server.connection);
     try server.run(std.testing.io, std.testing.allocator, &stream.transport);
     try std.testing.expect(std.mem.startsWith(u8, aw.written(), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[],\"structuredContent\":[[[["));
+}
+
+test "requests before initialize are rejected" {
+    var handler: TestHandler = .{};
+    var reader: std.Io.Reader = .fixed(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+        \\{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}
+        \\{"jsonrpc":"2.0","id":4,"method":"prompts/list"}
+        \\
+    );
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var stream: Transport.Stream = .init(&reader, &aw.writer);
+    var server: TestServer = .init(&handler);
+    try server.run(std.testing.io, std.testing.allocator, &stream.transport);
+
+    var lines = std.mem.splitScalar(u8, aw.written(), '\n');
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Server not initialized"}}
+    , lines.next().?);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":2,"result":{}}
+    , lines.next().?);
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"protocolVersion\""));
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"prompts\""));
+}
+
+test "Context.request needs concurrency" {
+    const Handler = struct {
+        fn sample(ctx: *Context) ![]const u8 {
+            _ = try ctx.request("roots/list", {});
+            return "unreachable";
+        }
+    };
+    const S = Server(Handler, .{ .name = "s", .version = "0", .tools = .{.{ .name = "sample", .call = Handler.sample }} });
+    var handler: Handler = .{};
+    try expectServerExchange(S, &handler,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample"}}
+        \\
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"RequestsUnavailable"}],"isError":true}}
+        \\
+    );
+}
+
+const ConcurrentHandler = struct {
+    /// Releases the `wait` tool.
+    release: std.Io.Event = .unset,
+    /// Set when `wait` observed its cancelation.
+    canceled: std.atomic.Value(bool) = .init(false),
+    /// Responses to requests the handler sent itself.
+    own_responses: std.atomic.Value(u32) = .init(0),
+
+    pub fn onResponse(handler: *ConcurrentHandler, response: json_rpc.JsonRPCMessage.Response) void {
+        _ = response;
+        _ = handler.own_responses.fetchAdd(1, .acq_rel);
+    }
+
+    fn wait(handler: *ConcurrentHandler, ctx: *Context) ![]const u8 {
+        handler.release.wait(ctx.io) catch |err| {
+            handler.canceled.store(true, .release);
+            return err;
+        };
+        return "released";
+    }
+
+    fn sample(ctx: *Context) ![]const u8 {
+        const result = ctx.request("sampling/createMessage", .{
+            .messages = &.{.{ .role = .user, .content = .initText("hi") }},
+            .maxTokens = 10,
+        }) catch |err| switch (err) {
+            error.RequestFailed => return ctx.fail(err, "client error: {s}", .{ctx.response_error.?.message}),
+            else => |e| return e,
+        };
+        return switch (result.content) {
+            .text => |text| text.text,
+            else => "not text",
+        };
+    }
+};
+
+const ConcurrentServer = Server(ConcurrentHandler, .{
+    .name = "c",
+    .version = "0",
+    .concurrency = .concurrent,
+    .max_concurrent_requests = 2,
+    .shutdown_timeout_ms = 100,
+    .tools = .{
+        .{ .name = "wait", .call = ConcurrentHandler.wait },
+        .{ .name = "sample", .call = ConcurrentHandler.sample },
+    },
+});
+
+/// Runs a `ConcurrentServer` in its own task and talks to it like a client.
+const TestClient = struct {
+    incoming: [16][]u8 = undefined,
+    outgoing: [16][]u8 = undefined,
+    channel: Transport.Channel = undefined,
+    handler: ConcurrentHandler = .{},
+    server: ConcurrentServer = undefined,
+    run: std.Io.Future(@typeInfo(@TypeOf(ConcurrentServer.run)).@"fn".return_type.?) = undefined,
+
+    const io = std.testing.io;
+
+    fn start(client: *TestClient, capabilities: []const u8) !void {
+        client.channel = .init(std.testing.allocator, &client.incoming, &client.outgoing);
+        client.server = .init(&client.handler);
+        client.run = try io.concurrent(ConcurrentServer.run, .{ &client.server, io, std.testing.allocator, &client.channel.transport });
+        const initialize = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{s},"clientInfo":{{"name":"c","version":"0"}}}}}}
+        , .{capabilities});
+        defer std.testing.allocator.free(initialize);
+        try client.send(initialize);
+        const response = try client.channel.receive(io);
+        defer std.testing.allocator.free(response);
+        try std.testing.expect(std.mem.startsWith(u8, response, "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\""));
+    }
+
+    fn send(client: *TestClient, message: []const u8) !void {
+        try client.channel.send(io, message);
+    }
+
+    fn expect(client: *TestClient, expected: []const u8) !void {
+        const message = try client.channel.receive(io);
+        defer std.testing.allocator.free(message);
+        try std.testing.expectEqualStrings(expected, message);
+    }
+
+    /// Closes the input and waits for the server to finish.
+    fn stop(client: *TestClient) !void {
+        client.channel.close(io);
+        try client.run.await(io);
+        client.channel.deinit(io);
+    }
+};
+
+test "concurrent: slow requests do not block others" {
+    var client: TestClient = .{};
+    try client.start("{}");
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait"}}
+    );
+    try client.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    );
+    // Answered while `wait` is still running.
+    const list = try client.channel.receive(TestClient.io);
+    defer std.testing.allocator.free(list);
+    try std.testing.expect(std.mem.startsWith(u8, list, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\""));
+
+    client.handler.release.set(TestClient.io);
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"released"}]}}
+    );
+    try client.stop();
+}
+
+test "concurrent: notifications/cancelled cancels the handler" {
+    var client: TestClient = .{};
+    try client.start("{}");
+    try client.send(
+        \\{"jsonrpc":"2.0","id":"x","method":"tools/call","params":{"name":"wait"}}
+    );
+    try client.send(
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"x"}}
+    );
+    // The canceled request is not answered: the next message is the ping response.
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"ping"}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+    );
+    // The cancelation reaches the handler asynchronously; wait for it (up
+    // to 2 s), then release the handler so that a broken cancelation fails
+    // the check below instead of hanging.
+    for (0..200) |_| {
+        if (client.handler.canceled.load(.acquire)) break;
+        try TestClient.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    client.handler.release.set(TestClient.io);
+    try client.stop();
+    try std.testing.expect(client.handler.canceled.load(.acquire));
+}
+
+test "concurrent: limits, duplicate ids and shutdown with requests in flight" {
+    var client: TestClient = .{};
+    try client.start("{}");
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait"}}
+    );
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait"}}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"A request with this id is already in progress"}}
+    );
+    try client.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wait"}}
+    );
+    try client.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wait"}}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"Too many concurrent requests"}}
+    );
+    // Closing the input waits for the requests in flight.
+    client.handler.release.set(TestClient.io);
+    try client.stop();
+}
+
+test "concurrent: Context.request" {
+    var client: TestClient = .{};
+    try client.start("{\"sampling\":{}}");
+
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample"}}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":"blitzmcp-1","method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"hi"}}],"maxTokens":10}}
+    );
+    try client.send(
+        \\{"jsonrpc":"2.0","id":"blitzmcp-1","result":{"role":"assistant","content":{"type":"text","text":"hello"},"model":"m"}}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"}]}}
+    );
+
+    // The client responds with an error.
+    try client.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sample"}}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":"blitzmcp-2","method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"hi"}}],"maxTokens":10}}
+    );
+    try client.send(
+        \\{"jsonrpc":"2.0","id":"blitzmcp-2","error":{"code":-1,"message":"user rejected"}}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"client error: user rejected"}],"isError":true}}
+    );
+
+    // The client goes away while the server waits for a response.
+    try client.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sample"}}
+    );
+    const request = try client.channel.receive(TestClient.io);
+    std.testing.allocator.free(request);
+    client.channel.close(TestClient.io);
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ConnectionClosed"}],"isError":true}}
+    );
+    try client.stop();
+}
+
+test "concurrent: Context.request checks client capabilities and forwards cancelation" {
+    {
+        var client: TestClient = .{};
+        try client.start("{}");
+        try client.send(
+            \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample"}}
+        );
+        try client.expect(
+            \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"CapabilityMissing"}],"isError":true}}
+        );
+        try client.stop();
+    }
+    {
+        var client: TestClient = .{};
+        try client.start("{\"sampling\":{}}");
+        try client.send(
+            \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample"}}
+        );
+        const request = try client.channel.receive(TestClient.io);
+        std.testing.allocator.free(request);
+        // Canceling the tool call cancels the request to the client.
+        try client.send(
+            \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}
+        );
+        try client.expect(
+            \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"blitzmcp-1","reason":"The request was canceled by the server"}}
+        );
+        try client.stop();
+    }
+}
+
+test "concurrent: ids can be reused as soon as the response arrived" {
+    var client: TestClient = .{};
+    try client.start("{}");
+    client.handler.release.set(TestClient.io);
+    for (0..20) |_| {
+        try client.send(
+            \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait"}}
+        );
+        try client.expect(
+            \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"released"}]}}
+        );
+        // Unregistered before the response was written.
+        const connection = &client.server.connection;
+        connection.mutex.lockUncancelable(TestClient.io);
+        defer connection.mutex.unlock(TestClient.io);
+        try std.testing.expectEqual(0, connection.in_flight.count());
+    }
+    try client.stop();
+}
+
+test "concurrent: responses to the handler's own requests are not taken by Context.request" {
+    var client: TestClient = .{};
+    try client.start("{\"sampling\":{}}");
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample"}}
+    );
+    const request = try client.channel.receive(TestClient.io);
+    std.testing.allocator.free(request);
+    // A response with a numeric id belongs to the handler (`onResponse`).
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+    );
+    try client.send(
+        \\{"jsonrpc":"2.0","id":"blitzmcp-1","result":{"role":"assistant","content":{"type":"text","text":"hello"},"model":"m"}}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"}]}}
+    );
+    try client.stop();
+    try std.testing.expectEqual(1, client.handler.own_responses.load(.acquire));
+}
+
+test "run can be called again for another session" {
+    var handler: TestHandler = .{};
+    var server: TestServer = .init(&handler);
+    for (0..2) |_| {
+        var reader: std.Io.Reader = .fixed(
+            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}
+            \\{"jsonrpc":"2.0","id":2,"method":"logging/setLevel","params":{"level":"error"}}
+            \\
+        );
+        var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        var stream: Transport.Stream = .init(&reader, &aw.writer);
+        try server.run(std.testing.io, std.testing.allocator, &stream.transport);
+        try std.testing.expect(std.mem.startsWith(u8, aw.written(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\""));
+        // The log level does not carry over either.
+        try std.testing.expectEqual(null, server.connection.logLevel());
+    }
+}
+
+test "concurrent: requests still running after the input ends are canceled" {
+    var client: TestClient = .{};
+    try client.start("{}");
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait"}}
+    );
+    // `wait` is never released: closing the input must still let `run` return
+    // (after `shutdown_timeout_ms`) by canceling it.
+    try client.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":2,"result":{}}
+    );
+    try client.stop();
+    try std.testing.expect(client.handler.canceled.load(.acquire));
+}
+
+test "concurrent: without concurrency, requests are handled serially" {
+    var single_threaded: std.Io.Threaded = .init_single_threaded;
+    const io = single_threaded.io();
+    var handler: ConcurrentHandler = .{};
+    var reader: std.Io.Reader = .fixed(
+        \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"sampling":{}},"clientInfo":{"name":"c","version":"0"}}}
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample"}}
+        \\
+    );
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var stream: Transport.Stream = .init(&reader, &aw.writer);
+    var server: ConcurrentServer = .init(&handler);
+    try server.run(io, std.testing.allocator, &stream.transport);
+
+    // `ctx.request` fails instead of deadlocking.
+    var lines = std.mem.splitScalar(u8, aw.written(), '\n');
+    _ = lines.next(); // initialize
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"RequestsUnavailable"}],"isError":true}}
+    , lines.next().?);
+}
+
+test "error.Canceled from a handler is answered unless the client canceled" {
+    const Handler = struct {
+        fn cancel() !void {
+            return error.Canceled;
+        }
+    };
+    const S = Server(Handler, .{ .name = "s", .version = "0", .tools = .{.{ .name = "cancel", .call = Handler.cancel }} });
+    var handler: Handler = .{};
+    try expectServerExchange(S, &handler,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cancel"}}
+        \\
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Canceled"}],"isError":true}}
+        \\
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -1549,6 +2326,8 @@ fn fuzzHandleMessage(_: void, smith: *std.testing.Smith) !void {
     var stream: Transport.Stream = .init(&reader, &aw.writer);
     var handler: FuzzHandler = .{};
     var server: FuzzServer = .init(&handler);
+    // Most inputs start initialized; the others also fuzz the lifecycle checks.
+    if (!smith.value(bool)) testInitialize(&server.connection);
 
     // Several messages for the same server, so that sequences (e.g.
     // `logging/setLevel` followed by a tool call) are fuzzed too.

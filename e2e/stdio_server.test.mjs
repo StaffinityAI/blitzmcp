@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
+  CreateMessageRequestSchema,
   ErrorCode,
   LATEST_PROTOCOL_VERSION,
   McpError,
@@ -27,6 +28,7 @@ let client;
 /** @type {StdioClientTransport} */
 let transport;
 let negotiatedProtocolVersion;
+const samplingRequests = [];
 /** Every JSON-RPC message sent to and received from the server, in order. */
 const sent = [];
 const received = [];
@@ -82,7 +84,18 @@ before(async () => {
     negotiatedProtocolVersion = version;
   };
   recordSent(transport);
-  client = new Client({ name: "blitzmcp-e2e", version: "0.0.0" });
+  client = new Client({ name: "blitzmcp-e2e", version: "0.0.0" }, { capabilities: { sampling: {} } });
+  // Sampling: the server's `summarize` tool asks the client's "LLM".
+  client.setRequestHandler(CreateMessageRequestSchema, async (request) => {
+    samplingRequests.push(request.params);
+    const text = request.params.messages[0].content.text;
+    if (text.includes("FAIL")) throw new Error("the user declined");
+    return {
+      role: "assistant",
+      content: { type: "text", text: `summary of ${text.length} characters` },
+      model: "e2e-model",
+    };
+  });
   await client.connect(transport);
   recordReceived(transport);
 });
@@ -119,7 +132,7 @@ test("tools/list", async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(
     tools.map((tool) => tool.name),
-    ["increment", "count_words"],
+    ["increment", "count_words", "countdown", "summarize"],
   );
 
   const [increment, countWords] = tools;
@@ -258,6 +271,72 @@ test("prompts", async () => {
     assert.equal(err.code, ErrorCode.InvalidParams);
     return true;
   });
+});
+
+test("concurrency: a slow tool does not block other requests", async () => {
+  let slowDone = false;
+  const slow = client.callTool({ name: "countdown", arguments: { from: 10 } }).then((result) => {
+    slowDone = true;
+    return result;
+  });
+  // Answered while the countdown (about 1 s) is still running.
+  await client.ping();
+  const { tools } = await client.listTools();
+  assert.equal(tools.length, 4);
+  assert.equal(slowDone, false);
+
+  const result = await slow;
+  assert.deepEqual(result.content, [{ type: "text", text: "liftoff" }]);
+});
+
+test("cancellation: aborting a tool call cancels it on the server", async () => {
+  const controller = new AbortController();
+  // Uncanceled, the countdown takes about 500 ms.
+  const call = client.callTool({ name: "countdown", arguments: { from: 5 } }, undefined, {
+    signal: controller.signal,
+    // Cancel after the first step.
+    onprogress: () => controller.abort("enough"),
+  });
+  await assert.rejects(call);
+  const request = sent.findLast((m) => m.method === "tools/call");
+  const token = request.params._meta.progressToken;
+  assert.ok(
+    sent.some((m) => m.method === "notifications/cancelled" && m.params.requestId === request.id),
+    "the client sent notifications/cancelled",
+  );
+
+  // Wait longer than the uncanceled countdown would take.
+  const progressBefore = received.filter((m) => m.params?.progressToken === token).length;
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  await exchange(() => client.ping());
+
+  assert.equal(
+    received.filter((m) => m.id === request.id && ("result" in m || "error" in m)).length,
+    0,
+    "the canceled request was not answered",
+  );
+  assert.ok(
+    received.filter((m) => m.params?.progressToken === token).length <= progressBefore + 1,
+    "the countdown stopped",
+  );
+});
+
+test("sampling: tools can send requests to the client", async () => {
+  const result = await client.callTool({ name: "summarize", arguments: { text: "Zig is a language." } });
+  assert.equal(result.isError, undefined);
+  const prompt = "Summarize in one sentence: Zig is a language.";
+  assert.deepEqual(result.content, [{ type: "text", text: `summary of ${prompt.length} characters` }]);
+  assert.deepEqual(samplingRequests.at(-1), {
+    messages: [
+      { role: "user", content: { type: "text", text: prompt } },
+    ],
+    maxTokens: 100,
+  });
+
+  // The client's error is reported as a tool error.
+  const failed = await client.callTool({ name: "summarize", arguments: { text: "FAIL" } });
+  assert.equal(failed.isError, true);
+  assert.match(failed.content[0].text, /^Sampling failed: .*the user declined/);
 });
 
 test("unsupported methods", async () => {
