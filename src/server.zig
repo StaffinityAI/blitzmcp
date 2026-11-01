@@ -70,11 +70,9 @@ pub const Context = struct {
     request_id: ?json_rpc.ID,
     /// Set if the client requested progress notifications for this request.
     progress_token: ?types.ProgressToken,
-    /// Set when the request is handled concurrently and can be canceled.
+    /// Set when the request is handled concurrently (in its own task, while
+    /// the server keeps reading messages) and can be canceled.
     in_flight: ?*Connection.InFlight = null,
-    /// Whether the handler runs in its own task while the server keeps reading
-    /// messages. Required for `request`.
-    concurrent: bool = false,
     /// Set by `fail`. Replaces the error name in the reported message if the
     /// handler returns `error_message_for`.
     error_message: ?[]const u8 = null,
@@ -159,7 +157,8 @@ pub const Context = struct {
         const connection = ctx.connection;
         // The response is read by the task that reads all messages; waiting
         // for it on that task would deadlock.
-        if (!ctx.concurrent) return error.RequestsUnavailable;
+        if (ctx.in_flight == null) return error.RequestsUnavailable;
+        ctx.response_error = null;
 
         const capabilities = connection.client_capabilities;
         const supported = if (comptime std.mem.eql(u8, method, "sampling/createMessage"))
@@ -174,18 +173,20 @@ pub const Context = struct {
         if (M.Params != void) try checkJson(params);
 
         var pending: Connection.Pending = .{};
-        const id = try connection.addPending(ctx.io, &pending);
+        const number = try connection.addPending(ctx.io, &pending);
         defer {
             // Remove first, so that no response can be delivered after it was freed.
-            connection.removePending(ctx.io, id);
+            connection.removePending(ctx.io, number);
             if (pending.response) |response| connection.gpa.free(response);
         }
+        var id_buffer: [Connection.request_id_prefix.len + 20]u8 = undefined;
+        const id = Connection.requestId(&id_buffer, number);
 
-        try ctx.transport.writeRequest(ctx.io, ctx.arena, .{ .number = id }, method, M.Params, params, stringify_options);
+        try ctx.transport.writeRequest(ctx.io, ctx.arena, id, method, M.Params, params, stringify_options);
         pending.done.wait(ctx.io) catch |err| switch (err) {
             error.Canceled => {
                 ctx.sendNotification("notifications/cancelled", types.CancelledNotificationParams, .{
-                    .requestId = .{ .number = id },
+                    .requestId = id,
                     .reason = "The request was canceled by the server",
                 }) catch {};
                 return error.Canceled;
@@ -211,6 +212,19 @@ pub const Context = struct {
                 .ignore_unknown_fields = true,
             }) catch error.InvalidResponse,
         }
+    }
+
+    /// Writes the response to the current request. The request is unregistered
+    /// first, so that the client can reuse its id and slot right away.
+    fn respond(ctx: *Context, comptime Result: type, result: Result) (Transport.WriteError || std.mem.Allocator.Error)!void {
+        if (ctx.in_flight) |in_flight| ctx.connection.removeInFlight(ctx.io, in_flight);
+        try ctx.transport.writeResponse(ctx.io, ctx.arena, ctx.request_id, Result, result, stringify_options);
+    }
+
+    /// Like `respond`, with an error response.
+    fn respondError(ctx: *Context, err: json_rpc.JsonRPCMessage.Response.Error) (Transport.WriteError || std.mem.Allocator.Error)!void {
+        if (ctx.in_flight) |in_flight| ctx.connection.removeInFlight(ctx.io, in_flight);
+        try ctx.transport.writeErrorResponse(ctx.io, ctx.arena, ctx.request_id, err, stringify_options);
     }
 
     /// Returns `err` and reports the formatted message instead of the error
@@ -372,8 +386,11 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
         /// Reads and handles messages until the transport reaches the end of
         /// the stream (e.g. stdin has been closed). With `.concurrency =
         /// .concurrent`, waits for the requests in flight before returning.
+        /// When it returns, the connection is reset, so that `run` can be
+        /// called again for another session.
         pub fn run(self: *Self, io: std.Io, gpa: std.mem.Allocator, transport: *Transport) !void {
             self.connection.gpa = gpa;
+            defer self.connection.reset();
             return switch (concurrency) {
                 .serial => self.runSerial(io, gpa, transport),
                 .concurrent => self.runConcurrent(io, gpa, transport),
@@ -540,7 +557,6 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                     .clock = .awake,
                 } }) catch {};
                 group.cancel(io);
-                self.connection.reset();
             }
 
             while (true) {
@@ -568,14 +584,11 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
             json_message: []u8,
             arena_allocator: std.heap.ArenaAllocator,
             request: json_rpc.JsonRPCMessage.Request,
-            /// The key in `Connection.in_flight`, see `Connection.idKey`.
-            key: []u8,
-            registered: bool = false,
-            in_flight: Connection.InFlight = .{},
+            /// Its id points into the request, i.e. the arena or the message.
+            in_flight: Connection.InFlight,
 
             fn destroy(task: *RequestTask) void {
-                if (task.registered) task.server.connection.removeInFlight(task.io, task.key);
-                task.gpa.free(task.key);
+                task.server.connection.removeInFlight(task.io, &task.in_flight);
                 task.arena_allocator.deinit();
                 task.gpa.free(task.json_message);
                 task.gpa.destroy(task);
@@ -601,11 +614,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 .spawn => |request| request,
             };
 
-            const key = Connection.idKey(gpa, request.id) catch return handleOutOfMemory(io, transport, kind, error.OutOfMemory);
-            const task = gpa.create(RequestTask) catch {
-                gpa.free(key);
-                return handleOutOfMemory(io, transport, kind, error.OutOfMemory);
-            };
+            const task = gpa.create(RequestTask) catch return handleOutOfMemory(io, transport, kind, error.OutOfMemory);
             // The parsed request points into the arena and the message, which
             // now belong to the task. (Moving the arena is fine: only its
             // buffers are referenced.)
@@ -617,19 +626,17 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 .json_message = json_message,
                 .arena_allocator = arena_allocator,
                 .request = request,
-                .key = key,
+                .in_flight = .{ .id = request.id },
             };
             handed_off = true;
             var spawned = false;
             defer if (!spawned) task.destroy();
 
-            self.connection.addInFlight(io, key, &task.in_flight, max_concurrent_requests) catch |err| switch (err) {
+            self.connection.addInFlight(io, &task.in_flight, max_concurrent_requests) catch |err| switch (err) {
                 error.OutOfMemory => return handleOutOfMemory(io, transport, kind, error.OutOfMemory),
                 error.DuplicateId => return writeFallbackError(io, transport, request.id, .invalid_request, "A request with this id is already in progress"),
                 error.TooManyRequests => return writeFallbackError(io, transport, request.id, server_busy, "Too many concurrent requests"),
             };
-            task.registered = true;
-
             group.concurrent(io, requestTask, .{task}) catch |err| switch (err) {
                 error.ConcurrencyUnavailable => return writeFallbackError(io, transport, request.id, server_busy, "Too many concurrent requests"),
             };
@@ -666,29 +673,27 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 .request_id = task.request.id,
                 .progress_token = extractProgressToken(task.request.params),
                 .in_flight = &task.in_flight,
-                .concurrent = true,
             };
             task.server.handleRequest(&ctx, task.request) catch |err| switch (err) {
-                error.OutOfMemory => handleOutOfMemory(io, task.transport, .{ .request = task.request.id }, error.OutOfMemory) catch |e| {
-                    log.warn("failed to write a response: {}", .{e});
+                error.OutOfMemory => {
+                    task.server.connection.removeInFlight(io, &task.in_flight);
+                    handleOutOfMemory(io, task.transport, .{ .request = task.request.id }, error.OutOfMemory) catch |e| {
+                        log.warn("failed to write a response: {}", .{e});
+                    };
                 },
                 else => log.warn("failed to write a response: {}", .{err}),
             };
         }
 
         fn handleRequest(self: *Self, ctx: *Context, request: json_rpc.JsonRPCMessage.Request) !void {
-            const initialized = self.connection.isInitialized();
-            if (!initialized and !allowedBeforeInitialize(request.method)) {
-                return ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{
-                    .code = .invalid_request,
-                    .message = "Server not initialized",
-                }, stringify_options);
+            const is_initialize = std.mem.eql(u8, request.method, "initialize");
+            if (is_initialize and !self.connection.beginInitialize()) {
+                return ctx.respondError(.{ .code = .invalid_request, .message = "Server already initialized" });
             }
-            if (initialized and std.mem.eql(u8, request.method, "initialize")) {
-                return ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{
-                    .code = .invalid_request,
-                    .message = "Server already initialized",
-                }, stringify_options);
+            // No effect once `initialize` succeeded.
+            defer if (is_initialize) self.connection.abortInitialize();
+            if (!is_initialize and !self.connection.isInitialized() and !allowedBeforeInitialize(request.method)) {
+                return ctx.respondError(.{ .code = .invalid_request, .message = "Server not initialized" });
             }
             inline for (comptime std.meta.declarations(types.client_requests)) |method| {
                 if ((comptime isImplemented(method)) and std.mem.eql(u8, request.method, method)) {
@@ -696,7 +701,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 }
             }
             const message = try std.fmt.allocPrint(ctx.arena, "Method not found: {s}", .{request.method});
-            try ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{ .code = .method_not_found, .message = message }, stringify_options);
+            try ctx.respondError(.{ .code = .method_not_found, .message = message });
         }
 
         fn handleKnownRequest(self: *Self, comptime method: []const u8, ctx: *Context, request: json_rpc.JsonRPCMessage.Request) !void {
@@ -709,7 +714,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 .{ .ignore_unknown_fields = true },
             ) catch |err| {
                 const message = try std.fmt.allocPrint(ctx.arena, "Invalid params: {s}", .{@errorName(err)});
-                return ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{ .code = .invalid_params, .message = message }, stringify_options);
+                return ctx.respondError(.{ .code = .invalid_params, .message = message });
             };
 
             const result_or_error = if (@hasDecl(Handler, method)) blk: {
@@ -735,12 +740,12 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
             if (result_or_error) |result| {
                 checkJson(result) catch |err| {
                     log.warn("invalid result for '{s}' request: {s}", .{ method, jsonValueErrorMessage(err) });
-                    return ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{
+                    return ctx.respondError(.{
                         .code = .internal_error,
                         .message = try std.fmt.allocPrint(ctx.arena, "Invalid result: {s}", .{jsonValueErrorMessage(err)}),
-                    }, stringify_options);
+                    });
                 };
-                try ctx.transport.writeResponse(ctx.io, ctx.arena, request.id, M.Result, result, stringify_options);
+                try ctx.respond(M.Result, result);
                 // Only once the client got a successful response.
                 if (comptime std.mem.eql(u8, method, "initialize")) self.connection.markInitialized(params);
             } else |err| {
@@ -751,10 +756,10 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 } else {
                     log.debug("failed to handle '{s}' request: {}", .{ method, err });
                 }
-                try ctx.transport.writeErrorResponse(ctx.io, ctx.arena, request.id, .{
+                try ctx.respondError(.{
                     .code = code,
                     .message = try ctx.errorMessage(err),
-                }, stringify_options);
+                });
             }
         }
 
@@ -841,9 +846,7 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                 if (std.json.parseFromValueLeaky(types.CancelledNotificationParams, ctx.arena, paramsOrEmpty(notification.params), .{
                     .ignore_unknown_fields = true,
                 })) |params| {
-                    if (params.requestId) |id| self.connection.cancelInFlight(ctx.io, id) catch |err| {
-                        log.warn("failed to cancel a request: {}", .{err});
-                    };
+                    if (params.requestId) |id| self.connection.cancelInFlight(ctx.io, id);
                 } else |_| {}
             }
             inline for (comptime std.meta.declarations(types.client_notifications)) |method| {
@@ -1407,6 +1410,11 @@ const TestServer = Server(TestHandler, .{
     },
 });
 
+/// Initializes the connection for tests that do not send `initialize`.
+fn testInitialize(connection: *Connection) void {
+    connection.markInitialized(.{ .protocolVersion = types.latest_protocol_version, .capabilities = .{}, .clientInfo = .{ .name = "test", .version = "0" } });
+}
+
 fn expectExchange(handler: *TestHandler, input: []const u8, expected_output: []const u8) !void {
     try expectServerExchange(TestServer, handler, input, expected_output);
 }
@@ -1418,7 +1426,7 @@ fn expectServerExchange(comptime S: type, handler: anytype, input: []const u8, e
 
     var stream: Transport.Stream = .init(&reader, &aw.writer);
     var server: S = .init(handler);
-    server.connection.initialized.store(true, .release);
+    testInitialize(&server.connection);
     try server.run(std.testing.io, std.testing.allocator, &stream.transport);
 
     try std.testing.expectEqualStrings(expected_output, aw.written());
@@ -1772,7 +1780,7 @@ test "deeply nested and raw results are rejected instead of crashing" {
     defer aw.deinit();
     var stream: Transport.Stream = .init(&reader, &aw.writer);
     var server: S = .init(&handler);
-    server.connection.initialized.store(true, .release);
+    testInitialize(&server.connection);
     try server.run(std.testing.io, std.testing.allocator, &stream.transport);
     try std.testing.expect(std.mem.startsWith(u8, aw.written(), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[],\"structuredContent\":[[[["));
 }
@@ -1826,6 +1834,13 @@ const ConcurrentHandler = struct {
     release: std.Io.Event = .unset,
     /// Set when `wait` observed its cancelation.
     canceled: std.atomic.Value(bool) = .init(false),
+    /// Responses to requests the handler sent itself.
+    own_responses: std.atomic.Value(u32) = .init(0),
+
+    pub fn onResponse(handler: *ConcurrentHandler, response: json_rpc.JsonRPCMessage.Response) void {
+        _ = response;
+        _ = handler.own_responses.fetchAdd(1, .acq_rel);
+    }
 
     fn wait(handler: *ConcurrentHandler, ctx: *Context) ![]const u8 {
         handler.release.wait(ctx.io) catch |err| {
@@ -1877,18 +1892,18 @@ const TestClient = struct {
         client.channel = .init(std.testing.allocator, &client.incoming, &client.outgoing);
         client.server = .init(&client.handler);
         client.run = try io.concurrent(ConcurrentServer.run, .{ &client.server, io, std.testing.allocator, &client.channel.transport });
-        try client.send(try std.fmt.allocPrint(std.testing.allocator,
+        const initialize = try std.fmt.allocPrint(std.testing.allocator,
             \\{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{s},"clientInfo":{{"name":"c","version":"0"}}}}}}
-        , .{capabilities}));
+        , .{capabilities});
+        defer std.testing.allocator.free(initialize);
+        try client.send(initialize);
         const response = try client.channel.receive(io);
         defer std.testing.allocator.free(response);
         try std.testing.expect(std.mem.startsWith(u8, response, "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\""));
     }
 
-    /// Takes ownership of `message` if it was allocated, see `start`.
     fn send(client: *TestClient, message: []const u8) !void {
         try client.channel.send(io, message);
-        if (std.mem.startsWith(u8, message, "{\"jsonrpc\":\"2.0\",\"id\":0,")) std.testing.allocator.free(message);
     }
 
     fn expect(client: *TestClient, expected: []const u8) !void {
@@ -1988,10 +2003,10 @@ test "concurrent: Context.request" {
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample"}}
     );
     try client.expect(
-        \\{"jsonrpc":"2.0","id":1,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"hi"}}],"maxTokens":10}}
+        \\{"jsonrpc":"2.0","id":"blitzmcp-1","method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"hi"}}],"maxTokens":10}}
     );
     try client.send(
-        \\{"jsonrpc":"2.0","id":1,"result":{"role":"assistant","content":{"type":"text","text":"hello"},"model":"m"}}
+        \\{"jsonrpc":"2.0","id":"blitzmcp-1","result":{"role":"assistant","content":{"type":"text","text":"hello"},"model":"m"}}
     );
     try client.expect(
         \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"}]}}
@@ -2002,10 +2017,10 @@ test "concurrent: Context.request" {
         \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sample"}}
     );
     try client.expect(
-        \\{"jsonrpc":"2.0","id":2,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"hi"}}],"maxTokens":10}}
+        \\{"jsonrpc":"2.0","id":"blitzmcp-2","method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"hi"}}],"maxTokens":10}}
     );
     try client.send(
-        \\{"jsonrpc":"2.0","id":2,"error":{"code":-1,"message":"user rejected"}}
+        \\{"jsonrpc":"2.0","id":"blitzmcp-2","error":{"code":-1,"message":"user rejected"}}
     );
     try client.expect(
         \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"client error: user rejected"}],"isError":true}}
@@ -2049,9 +2064,70 @@ test "concurrent: Context.request checks client capabilities and forwards cancel
             \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}
         );
         try client.expect(
-            \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"The request was canceled by the server"}}
+            \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"blitzmcp-1","reason":"The request was canceled by the server"}}
         );
         try client.stop();
+    }
+}
+
+test "concurrent: ids can be reused as soon as the response arrived" {
+    var client: TestClient = .{};
+    try client.start("{}");
+    client.handler.release.set(TestClient.io);
+    for (0..20) |_| {
+        try client.send(
+            \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait"}}
+        );
+        try client.expect(
+            \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"released"}]}}
+        );
+        // Unregistered before the response was written.
+        const connection = &client.server.connection;
+        connection.mutex.lockUncancelable(TestClient.io);
+        defer connection.mutex.unlock(TestClient.io);
+        try std.testing.expectEqual(0, connection.in_flight.count());
+    }
+    try client.stop();
+}
+
+test "concurrent: responses to the handler's own requests are not taken by Context.request" {
+    var client: TestClient = .{};
+    try client.start("{\"sampling\":{}}");
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample"}}
+    );
+    const request = try client.channel.receive(TestClient.io);
+    std.testing.allocator.free(request);
+    // A response with a numeric id belongs to the handler (`onResponse`).
+    try client.send(
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+    );
+    try client.send(
+        \\{"jsonrpc":"2.0","id":"blitzmcp-1","result":{"role":"assistant","content":{"type":"text","text":"hello"},"model":"m"}}
+    );
+    try client.expect(
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"}]}}
+    );
+    try client.stop();
+    try std.testing.expectEqual(1, client.handler.own_responses.load(.acquire));
+}
+
+test "run can be called again for another session" {
+    var handler: TestHandler = .{};
+    var server: TestServer = .init(&handler);
+    for (0..2) |_| {
+        var reader: std.Io.Reader = .fixed(
+            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}
+            \\{"jsonrpc":"2.0","id":2,"method":"logging/setLevel","params":{"level":"error"}}
+            \\
+        );
+        var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        var stream: Transport.Stream = .init(&reader, &aw.writer);
+        try server.run(std.testing.io, std.testing.allocator, &stream.transport);
+        try std.testing.expect(std.mem.startsWith(u8, aw.written(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\""));
+        // The log level does not carry over either.
+        try std.testing.expectEqual(null, server.connection.logLevel());
     }
 }
 
@@ -2251,7 +2327,7 @@ fn fuzzHandleMessage(_: void, smith: *std.testing.Smith) !void {
     var handler: FuzzHandler = .{};
     var server: FuzzServer = .init(&handler);
     // Most inputs start initialized; the others also fuzz the lifecycle checks.
-    if (!smith.value(bool)) server.connection.initialized.store(true, .release);
+    if (!smith.value(bool)) testInitialize(&server.connection);
 
     // Several messages for the same server, so that sequences (e.g.
     // `logging/setLevel` followed by a tool call) are fuzzed too.
