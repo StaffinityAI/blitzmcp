@@ -31,11 +31,14 @@ pub const InFlight = struct {
 
 /// A request to the client that is waiting for its response.
 pub const Pending = struct {
-    /// Set when the response arrived or the connection was closed.
+    /// Set when the response arrived, could not be stored, or the connection
+    /// was closed.
     done: std.Io.Event = .unset,
     /// The response message, allocated with `Connection.gpa`. `null` if the
-    /// connection was closed before the response arrived.
+    /// connection was closed before the response arrived or if the response
+    /// could not be stored (`out_of_memory`).
     response: ?[]u8 = null,
+    out_of_memory: bool = false,
 };
 
 mode: Mode = .serial,
@@ -53,23 +56,27 @@ log_level: std.atomic.Value(u8) = .init(no_log_level),
 /// Ids for requests to the client.
 next_request_id: std.atomic.Value(i64) = .init(1),
 
-/// Guards `in_flight`, `pending` and `closed`.
+/// Guards `in_flight`, `pending`, `closed` and `idle`.
 mutex: std.Io.Mutex = .init,
-/// Keyed by `idKey`.
+/// Keyed by `idKey`. The keys are owned by the requests' tasks.
 in_flight: std.StringHashMapUnmanaged(*InFlight) = .empty,
 pending: std.AutoHashMapUnmanaged(i64, *Pending) = .empty,
 /// Whether the client went away. No more responses will arrive.
 closed: bool = false,
+/// Set while no request is in flight.
+idle: std.Io.Event = .is_set,
 
 const no_log_level = std.math.maxInt(u8);
 
-pub fn deinit(c: *Connection) void {
-    std.debug.assert(c.pending.count() == 0);
-    var it = c.in_flight.keyIterator();
-    while (it.next()) |key| c.gpa.free(key.*);
+/// Frees the bookkeeping of a finished concurrent run and allows another run.
+/// Asserts that no requests are in flight in either direction.
+pub fn reset(c: *Connection) void {
+    std.debug.assert(c.in_flight.count() == 0 and c.pending.count() == 0);
     c.in_flight.deinit(c.gpa);
     c.pending.deinit(c.gpa);
-    c.* = undefined;
+    c.in_flight = .empty;
+    c.pending = .empty;
+    c.closed = false;
 }
 
 pub fn logLevel(c: *const Connection) ?types.LoggingLevel {
@@ -81,7 +88,9 @@ pub fn setLogLevel(c: *Connection, level: types.LoggingLevel) void {
     c.log_level.store(@backingInt(level), .release);
 }
 
+/// Must only be called once, before any request can run concurrently.
 pub fn markInitialized(c: *Connection, params: types.InitializeRequestParams) void {
+    std.debug.assert(!c.isInitialized());
     c.client_capabilities = .{
         .sampling = params.capabilities.sampling != null,
         .elicitation = params.capabilities.elicitation != null,
@@ -95,7 +104,7 @@ pub fn isInitialized(c: *const Connection) bool {
 }
 
 /// A unique string for a request id, used as the key of `in_flight`.
-fn idKey(allocator: std.mem.Allocator, id: json_rpc.ID) std.mem.Allocator.Error![]u8 {
+pub fn idKey(allocator: std.mem.Allocator, id: json_rpc.ID) std.mem.Allocator.Error![]u8 {
     return switch (id) {
         .number => |number| std.fmt.allocPrint(allocator, "n{d}", .{number}),
         .string => |string| std.fmt.allocPrint(allocator, "s{s}", .{string}),
@@ -109,38 +118,30 @@ pub const RegisterError = std.mem.Allocator.Error || error{
     TooManyRequests,
 };
 
-/// Registers a request from the client. `in_flight` must stay valid until
-/// `removeInFlight` is called.
-pub fn addInFlight(c: *Connection, io: std.Io, id: json_rpc.ID, in_flight: *InFlight, limit: usize) RegisterError!void {
-    const key = try idKey(c.gpa, id);
-    errdefer c.gpa.free(key);
-
+/// Registers a request from the client under `key` (see `idKey`). `key` and
+/// `in_flight` must stay valid until `removeInFlight` is called with `key`.
+pub fn addInFlight(c: *Connection, io: std.Io, key: []const u8, in_flight: *InFlight, limit: usize) RegisterError!void {
     c.mutex.lockUncancelable(io);
     defer c.mutex.unlock(io);
     if (c.in_flight.count() >= limit) return error.TooManyRequests;
     const entry = try c.in_flight.getOrPut(c.gpa, key);
     if (entry.found_existing) return error.DuplicateId;
     entry.value_ptr.* = in_flight;
+    c.idle.reset();
 }
 
-pub fn removeInFlight(c: *Connection, io: std.Io, id: json_rpc.ID) void {
-    var buffer: [64]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
-    const lookup = idKey(fba.allocator(), id) catch idKey(c.gpa, id) catch return;
-    defer if (lookup.ptr != &buffer) c.gpa.free(lookup);
-
+pub fn removeInFlight(c: *Connection, io: std.Io, key: []const u8) void {
     c.mutex.lockUncancelable(io);
     defer c.mutex.unlock(io);
-    if (c.in_flight.fetchRemove(lookup)) |entry| c.gpa.free(entry.key);
+    _ = c.in_flight.remove(key);
+    if (c.in_flight.count() == 0) c.idle.set(io);
 }
 
 /// Handles `notifications/cancelled` from the client. Unknown ids are ignored,
 /// the request may already have finished.
-pub fn cancelInFlight(c: *Connection, io: std.Io, id: json_rpc.ID) void {
-    var buffer: [64]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
-    const lookup = idKey(fba.allocator(), id) catch idKey(c.gpa, id) catch return;
-    defer if (lookup.ptr != &buffer) c.gpa.free(lookup);
+pub fn cancelInFlight(c: *Connection, io: std.Io, id: json_rpc.ID) std.mem.Allocator.Error!void {
+    const lookup = try idKey(c.gpa, id);
+    defer c.gpa.free(lookup);
 
     c.mutex.lockUncancelable(io);
     defer c.mutex.unlock(io);
@@ -168,7 +169,7 @@ pub fn removePending(c: *Connection, io: std.Io, id: i64) void {
 
 /// Hands a response from the client to the request waiting for it. Returns
 /// `false` if no request with this id is waiting.
-pub fn deliverResponse(c: *Connection, io: std.Io, id: json_rpc.ID, json_message: []const u8) std.mem.Allocator.Error!bool {
+pub fn deliverResponse(c: *Connection, io: std.Io, id: json_rpc.ID, json_message: []const u8) bool {
     const number = switch (id) {
         .number => |number| number,
         .string => return false,
@@ -177,8 +178,12 @@ pub fn deliverResponse(c: *Connection, io: std.Io, id: json_rpc.ID, json_message
     defer c.mutex.unlock(io);
     const pending = c.pending.get(number) orelse return false;
     if (pending.done.isSet()) return true; // duplicate response
-    pending.response = try c.gpa.dupe(u8, json_message);
-    pending.done.set(io);
+    // Wake the waiting request even if the response cannot be stored.
+    defer pending.done.set(io);
+    pending.response = c.gpa.dupe(u8, json_message) catch {
+        pending.out_of_memory = true;
+        return true;
+    };
     return true;
 }
 
@@ -194,36 +199,44 @@ pub fn close(c: *Connection, io: std.Io) void {
 
 test "in flight requests" {
     const io = std.testing.io;
-    var c: Connection = .{ .gpa = std.testing.allocator };
-    defer c.deinit();
+    const gpa = std.testing.allocator;
+    var c: Connection = .{ .gpa = gpa };
+    defer c.reset();
 
+    const key_a = try idKey(gpa, .{ .number = 1 });
+    defer gpa.free(key_a);
+    const key_b = try idKey(gpa, .{ .string = "1" });
+    defer gpa.free(key_b);
     var a: InFlight = .{};
     var b: InFlight = .{};
-    try c.addInFlight(io, .{ .number = 1 }, &a, 2);
-    try std.testing.expectError(error.DuplicateId, c.addInFlight(io, .{ .number = 1 }, &b, 2));
-    try c.addInFlight(io, .{ .string = "1" }, &b, 2);
+    try c.addInFlight(io, key_a, &a, 2);
+    try std.testing.expect(!c.idle.isSet());
+    try std.testing.expectError(error.DuplicateId, c.addInFlight(io, key_a, &b, 2));
+    try c.addInFlight(io, key_b, &b, 2);
     var d: InFlight = .{};
-    try std.testing.expectError(error.TooManyRequests, c.addInFlight(io, .{ .number = 2 }, &d, 2));
+    try std.testing.expectError(error.TooManyRequests, c.addInFlight(io, "n2", &d, 2));
 
-    c.cancelInFlight(io, .{ .string = "1" });
+    try c.cancelInFlight(io, .{ .string = "1" });
     try std.testing.expect(b.canceled.load(.acquire) and b.done.isSet());
     try std.testing.expect(!a.canceled.load(.acquire));
-    c.cancelInFlight(io, .{ .number = 42 }); // unknown
+    try c.cancelInFlight(io, .{ .number = 42 }); // unknown
 
-    c.removeInFlight(io, .{ .number = 1 });
-    c.removeInFlight(io, .{ .string = "1" });
+    c.removeInFlight(io, key_a);
+    try std.testing.expect(!c.idle.isSet());
+    c.removeInFlight(io, key_b);
+    try std.testing.expect(c.idle.isSet());
     try std.testing.expectEqual(0, c.in_flight.count());
 }
 
 test "pending requests" {
     const io = std.testing.io;
     var c: Connection = .{ .gpa = std.testing.allocator };
-    defer c.deinit();
+    defer c.reset();
 
     var pending: Pending = .{};
     const id = try c.addPending(io, &pending);
-    try std.testing.expect(!try c.deliverResponse(io, .{ .number = id + 1 }, "{}"));
-    try std.testing.expect(try c.deliverResponse(io, .{ .number = id }, "{\"x\":1}"));
+    try std.testing.expect(!c.deliverResponse(io, .{ .number = id + 1 }, "{}"));
+    try std.testing.expect(c.deliverResponse(io, .{ .number = id }, "{\"x\":1}"));
     try std.testing.expect(pending.done.isSet());
     try std.testing.expectEqualStrings("{\"x\":1}", pending.response.?);
     std.testing.allocator.free(pending.response.?);
@@ -236,4 +249,18 @@ test "pending requests" {
     c.removePending(io, other_id);
     var late: Pending = .{};
     try std.testing.expectError(error.ConnectionClosed, c.addPending(io, &late));
+}
+
+test "a response that cannot be stored still wakes the request" {
+    const io = std.testing.io;
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    var c: Connection = .{ .gpa = failing.allocator() };
+    defer c.reset();
+
+    var pending: Pending = .{};
+    const id = try c.addPending(io, &pending);
+    failing.fail_index = failing.alloc_index; // fail from now on
+    try std.testing.expect(c.deliverResponse(io, .{ .number = id }, "{}"));
+    try std.testing.expect(pending.done.isSet() and pending.out_of_memory and pending.response == null);
+    c.removePending(io, id);
 }

@@ -250,7 +250,8 @@ pub fn writeJsonMessage(transport: *Transport, io: std.Io, json_message: []const
     return try transport.vtable.writeJsonMessage(transport, io, json_message);
 }
 
-pub fn writeJsonMessageUncancelable(transport: *Transport, io: std.Io, json_message: []const u8) (WriteError || error{})!void {
+/// The error set is `WriteError` without `error.Canceled`.
+pub fn writeJsonMessageUncancelable(transport: *Transport, io: std.Io, json_message: []const u8) !void {
     const old_cancel_protect = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(old_cancel_protect);
     Transport.writeJsonMessage(transport, io, json_message) catch |err| switch (err) {
