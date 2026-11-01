@@ -17,6 +17,8 @@ jobs:
         os: [ubuntu-22.04, macos-latest, windows-latest]
         optimize: [Debug, ReleaseSafe]
     runs-on: ${{ matrix.os }}
+    # A hanging (e.g. deadlocked) test should fail quickly instead of after 6 hours.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,6 +40,7 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4

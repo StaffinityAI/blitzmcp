@@ -126,6 +126,111 @@ pub const Stream = struct {
     }
 };
 
+/// An in-memory transport that passes whole messages through two queues, one
+/// per direction. Useful for tests that act as an interactive client, and for
+/// transports that receive messages through other means (e.g. HTTP).
+///
+/// Messages are copied; `send`, `receive` and the transport functions are
+/// thread-safe.
+pub const Channel = struct {
+    transport: Transport,
+    allocator: std.mem.Allocator,
+    /// Messages from the client to the server.
+    incoming: std.Io.Queue([]u8),
+    /// Messages from the server to the client.
+    outgoing: std.Io.Queue([]u8),
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        /// Capacity for messages that have not been read by the server yet.
+        incoming_buffer: [][]u8,
+        /// Capacity for messages that have not been received by the client yet.
+        outgoing_buffer: [][]u8,
+    ) Channel {
+        return .{
+            .transport = .{
+                .vtable = &.{
+                    .readJsonMessage = &Channel.readJsonMessage,
+                    .writeJsonMessage = &Channel.writeJsonMessage,
+                },
+            },
+            .allocator = allocator,
+            .incoming = .init(incoming_buffer),
+            .outgoing = .init(outgoing_buffer),
+        };
+    }
+
+    /// Frees messages that have not been read.
+    pub fn deinit(channel: *Channel, io: std.Io) void {
+        channel.incoming.close(io);
+        channel.outgoing.close(io);
+        while (channel.incoming.getOne(io)) |message| channel.allocator.free(message) else |_| {}
+        while (channel.outgoing.getOne(io)) |message| channel.allocator.free(message) else |_| {}
+    }
+
+    /// Sends a message to the server.
+    pub fn send(channel: *Channel, io: std.Io, json_message: []const u8) (std.Io.QueueClosedError || std.Io.Cancelable || std.mem.Allocator.Error)!void {
+        const copy = try channel.allocator.dupe(u8, json_message);
+        errdefer channel.allocator.free(copy);
+        try channel.incoming.putOne(io, copy);
+    }
+
+    /// Signals the end of the stream to the server: once all sent messages
+    /// have been read, `readJsonMessage` returns `error.EndOfStream`.
+    pub fn close(channel: *Channel, io: std.Io) void {
+        channel.incoming.close(io);
+    }
+
+    /// Receives the next message from the server. Free it with `channel.allocator`.
+    pub fn receive(channel: *Channel, io: std.Io) (std.Io.QueueClosedError || std.Io.Cancelable)![]u8 {
+        return channel.outgoing.getOne(io);
+    }
+
+    fn readJsonMessage(transport: *Transport, io: std.Io, allocator: std.mem.Allocator) ReadError![]u8 {
+        const channel: *Channel = @fieldParentPtr("transport", transport);
+        const message = channel.incoming.getOne(io) catch |err| switch (err) {
+            error.Closed => return error.EndOfStream,
+            error.Canceled => |e| return e,
+        };
+        defer channel.allocator.free(message);
+        return allocator.dupe(u8, message);
+    }
+
+    fn writeJsonMessage(transport: *Transport, io: std.Io, json_message: []const u8) WriteError!void {
+        const channel: *Channel = @fieldParentPtr("transport", transport);
+        std.debug.assert(std.mem.findScalar(u8, json_message, '\n') == null);
+        const copy = channel.allocator.dupe(u8, json_message) catch return error.Unexpected;
+        channel.outgoing.putOne(io, copy) catch |err| {
+            channel.allocator.free(copy);
+            return switch (err) {
+                error.Closed => error.Unexpected,
+                error.Canceled => |e| e,
+            };
+        };
+    }
+};
+
+test Channel {
+    const io = std.testing.io;
+    var incoming: [4][]u8 = undefined;
+    var outgoing: [4][]u8 = undefined;
+    var channel: Channel = .init(std.testing.allocator, &incoming, &outgoing);
+    defer channel.deinit(io);
+    const transport = &channel.transport;
+
+    try channel.send(io, "{\"a\":1}");
+    channel.close(io);
+    const message = try transport.readJsonMessage(io, std.testing.allocator);
+    defer std.testing.allocator.free(message);
+    try std.testing.expectEqualStrings("{\"a\":1}", message);
+    try std.testing.expectError(error.EndOfStream, transport.readJsonMessage(io, std.testing.allocator));
+
+    try transport.writeNotification(io, std.testing.allocator, "x", void, {}, .{});
+    const reply = try channel.receive(io);
+    defer channel.allocator.free(reply);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"x\"}", reply);
+}
+
 /// Consider using `readJsonMessageUncancelable` to avoid `error.Canceled` being returned.
 pub fn readJsonMessage(transport: *Transport, io: std.Io, allocator: std.mem.Allocator) ReadError![]u8 {
     return try transport.vtable.readJsonMessage(transport, io, allocator);
@@ -145,7 +250,7 @@ pub fn writeJsonMessage(transport: *Transport, io: std.Io, json_message: []const
     return try transport.vtable.writeJsonMessage(transport, io, json_message);
 }
 
-pub fn writeJsonMessageUncancelable(transport: *Transport, io: std.Io, json_message: []const u8) !void {
+pub fn writeJsonMessageUncancelable(transport: *Transport, io: std.Io, json_message: []const u8) (WriteError || error{})!void {
     const old_cancel_protect = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(old_cancel_protect);
     Transport.writeJsonMessage(transport, io, json_message) catch |err| switch (err) {
@@ -221,6 +326,9 @@ pub fn writeErrorResponse(
 
 /// Serializes `value` and writes it as a single message.
 /// `options.whitespace` is ignored, messages are always minified.
+///
+/// The write is not a cancelation point: a canceled task must not leave a
+/// partially written message behind.
 fn writeValue(
     transport: *Transport,
     io: std.Io,
@@ -232,7 +340,7 @@ fn writeValue(
     minified_options.whitespace = .minified;
     const json_message = try std.json.Stringify.valueAlloc(allocator, value, minified_options);
     defer allocator.free(json_message);
-    try transport.writeJsonMessage(io, json_message);
+    try transport.writeJsonMessageUncancelable(io, json_message);
 }
 
 pub const ThreadSafeConfig = struct {

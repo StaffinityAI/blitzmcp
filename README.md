@@ -84,6 +84,7 @@ pub fn main(init: std.process.Init) !void {
 - Optional fields of tool and prompt arguments must have a default (e.g. `?u32 = null`); this is enforced at compile time.
 - Results and notifications are checked before sending: non-finite floats and text that is not valid UTF-8 are reported as errors instead of producing invalid JSON.
 - `Server.handleMessage` is independent of the framing so that it can be reused by other transports.
+- Requests other than `initialize` and `ping` are rejected until the server has answered `initialize`.
 - Messages larger than `max_message_len` (16 MiB by default) are skipped and answered with an error, and running out of memory while handling a request is reported to the client instead of stopping the server.
 
 > [!NOTE]
@@ -95,6 +96,25 @@ See [`examples/stdio_server.zig`](examples/stdio_server.zig) for a complete serv
 zig build
 npx @modelcontextprotocol/inspector zig-out/bin/stdio-server
 ```
+
+## Concurrency, cancellation and requests to the client
+
+With `.concurrency = .concurrent` in the server config, every request is handled in its own `std.Io` task:
+
+- Slow requests do not block others (including `ping`). At most `.max_concurrent_requests` (default 64) run at once; further requests get a JSON-RPC error.
+- `notifications/cancelled` cancels a request: its handler receives `error.Canceled` from its next `Io` call (e.g. `ctx.io.sleep`, a file read or `ctx.request`) and no response is sent. `ctx.isCanceled()` lets CPU-bound handlers check.
+- Handlers can send requests to the client and wait for the response:
+
+  ```zig
+  const result = try ctx.request("sampling/createMessage", .{
+      .messages = &.{.{ .role = .user, .content = .initText("Summarize ...") }},
+      .maxTokens = 100,
+  });
+  ```
+
+  `ctx.request` checks the capabilities the client declared (`error.CapabilityMissing`), reports the client's error response via `error.RequestFailed` and `ctx.response_error`, and forwards cancelation to the client.
+
+Handlers must be thread-safe in this mode, e.g. protect shared state with a `std.Io.Mutex`. It needs an `Io` implementation with concurrency such as `std.Io.Threaded` (what `std.process.Init` provides); otherwise requests are handled one after another. The default, `.concurrency = .serial`, handles one message at a time, and `ctx.request` returns `error.RequestsUnavailable`. See `examples/stdio_server.zig`.
 
 # Development
 
