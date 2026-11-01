@@ -7,6 +7,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "CHANGELOG.md",
         "LICENSE",
         "README.md",
     },

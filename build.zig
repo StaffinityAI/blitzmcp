@@ -1,7 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const minimum_zig_version = @import("build.zig.zon").minimum_zig_version;
+const zon = @import("build.zig.zon");
+const minimum_zig_version = zon.minimum_zig_version;
 
 pub fn build(b: *std.Build) void {
     comptime if (builtin.zig_version.order(std.SemanticVersion.parse(minimum_zig_version) catch unreachable) == .lt) {
@@ -117,8 +118,16 @@ pub fn build(b: *std.Build) void {
         fmt_check.addFileArg(b.path(path));
     }
 
+    // The version in build.zig.zon needs a CHANGELOG entry. The release
+    // workflow checks that the tag matches it.
+    const changelog_check = b.addCheckFile(b.path("CHANGELOG.md"), .{
+        .expected_matches = &.{"\n## [" ++ zon.version ++ "] - "},
+    });
+    changelog_check.setName("CHANGELOG.md has an entry for " ++ zon.version);
+
     const ci_step = b.step("ci", "Run everything that CI runs");
     ci_step.dependOn(&fmt_check.step);
+    ci_step.dependOn(&changelog_check.step);
     ci_step.dependOn(test_step);
     ci_step.dependOn(b.getInstallStep());
     ci_step.dependOn(docs_step);
