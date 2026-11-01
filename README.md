@@ -103,8 +103,8 @@ zig build test   # unit tests
 zig build e2e    # end-to-end tests: the official MCP TypeScript SDK client drives examples/stdio_server.zig (requires Node.js and npm)
 zig build ci     # everything CI runs: format check, unit tests, build, docs and e2e tests
 zig build ci -Doptimize=ReleaseSafe  # CI also runs everything in ReleaseSafe
-zig build test --fuzz=30K           # fuzz the message handler, the NDJSON reader and the result checks
+zig build test --fuzz=30K -Duse-llvm  # fuzz the message handler, the NDJSON reader and the result checks
 ```
 
-The fuzz targets are the tests named `fuzz …` (`fuzz handleMessage`, `fuzz readNdjsonMessage`, `fuzz checkJson`); `--fuzz` is not supported on Windows. CI fuzzes them with a new `--seed` for every run. `zig build test --fuzz` exits with code 0 even when it finds a failing input, so check for `.zig-cache/f/crash`, which contains the input (CI uploads it as the `fuzz-crash` artifact). To reproduce a failure and keep it as a regression test, add the file (via `@embedFile`) to the `corpus` of the failing `std.testing.fuzz` call; `zig build test` always runs the corpus.
+The fuzz targets are the tests named `fuzz …` (`fuzz handleMessage`, `fuzz readNdjsonMessage`, `fuzz checkJson`); `--fuzz` is not supported on Windows, and needs `-Duse-llvm` on x86_64 (the self-hosted backend emits no coverage instrumentation). CI fuzzes them with a new `--seed` for every run. `zig build test --fuzz` exits with code 0 even when it finds a failing input, so check for `.zig-cache/f/crash`, which contains the input (CI uploads it as the `fuzz-crash` artifact). To reproduce a failure and keep it as a regression test, add the file (via `@embedFile`) to the `corpus` of the failing `std.testing.fuzz` call; `zig build test` always runs the corpus.
 

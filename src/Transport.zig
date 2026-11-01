@@ -458,11 +458,22 @@ test "Stream - read and write uncancelable" {
 }
 
 test "fuzz readNdjsonMessage" {
-    try std.testing.fuzz({}, fuzzReadNdjsonMessage, .{ .corpus = &.{
-        "\x08\x00\x00\x00{}\n\r\n \t\n\x05\x02\x00",
-        "\x10\x00\x00\x00123456\nab\r\r\n{}" ++ "\x00\x00\x00\x00" ++ "\x03\x00",
-    } });
+    try std.testing.fuzz({}, fuzzReadNdjsonMessage, .{ .corpus = &fuzz_ndjson_corpus });
 }
+
+/// Each entry: the input, then `max_len` and the reader buffer size.
+const fuzz_ndjson_corpus = blk: {
+    const smithSlice = @import("server.zig").smithSlice;
+    const smithInt = @import("server.zig").smithInt;
+    break :blk [_][]const u8{
+        // Normal lines, `\r` stripping, blank lines and a reader buffer smaller than a line.
+        smithSlice("{}\n\r\n \t\n{\"a\":1}\r\n[1,2]") ++ smithInt(64) ++ smithInt(3),
+        // A line that is too long, followed by normal ones.
+        smithSlice("123456\nab\r\r\n{}") ++ smithInt(5) ++ smithInt(2),
+        // A line exactly at the limit and a final line without a newline.
+        smithSlice("12345\n1234") ++ smithInt(5) ++ smithInt(32),
+    };
+};
 
 /// Compares `readNdjsonMessage` with a simple reference implementation for
 /// random input, size limits and reader buffer sizes.
