@@ -92,12 +92,12 @@ fn schemaOf(comptime T: type, comptime description: ?[]const u8) []const u8 {
         .optional => |info| "{\"anyOf\":[" ++ schemaOf(info.child, null) ++ ",{\"type\":\"null\"}]" ++ desc ++ "}",
         .@"enum" => |info| blk: {
             var values: []const u8 = "";
-            for (info.field_names) |name| values = listAppend(values, jsonString(name));
+            for (info.fields) |field| values = listAppend(values, jsonString(field.name));
             const named = "{\"type\":\"string\",\"enum\":[" ++ values ++ "]";
-            break :blk switch (info.mode) {
-                .exhaustive => named ++ desc ++ "}",
+            break :blk switch (info.is_exhaustive) {
+                true => named ++ desc ++ "}",
                 // `std.json` serializes unnamed values as integers.
-                .nonexhaustive => "{\"anyOf\":[" ++ named ++ "}," ++ schemaOf(info.tag_type, null) ++ "]" ++ desc ++ "}",
+                false => "{\"anyOf\":[" ++ named ++ "}," ++ schemaOf(info.tag_type, null) ++ "]" ++ desc ++ "}",
             };
         },
         .pointer => |info| switch (info.size) {
@@ -136,13 +136,15 @@ fn structSchema(
     if (info.is_tuple) @compileError("unable to generate a JSON schema for the tuple " ++ @typeName(T));
     var properties: []const u8 = extra_properties;
     var required: []const u8 = extra_required;
-    for (info.field_names, info.field_types, info.field_attrs) |name, FieldType, attrs| {
-        if (attrs.@"comptime") continue;
+    for (info.fields) |field| {
+        if (field.is_comptime) continue;
+        const name = field.name;
+        const FieldType = field.type;
         const field_description = fieldDescription(T, name);
         const is_optional = @typeInfo(FieldType) == .optional;
         const PropertyType = if (is_optional) @typeInfo(FieldType).optional.child else FieldType;
         properties = listAppend(properties, jsonString(name) ++ ":" ++ schemaOf(PropertyType, field_description));
-        if (!is_optional and attrs.default_value_ptr == null) {
+        if (!is_optional and field.default_value_ptr == null) {
             required = listAppend(required, jsonString(name));
         }
     }
@@ -158,7 +160,9 @@ pub fn generateDiscriminated(comptime T: type, comptime tag_field: []const u8) [
     return comptime blk: {
         const info = @typeInfo(T).@"union";
         var variants: []const u8 = "";
-        for (info.field_names, info.field_types) |name, Payload| {
+        for (info.fields) |field| {
+            const name = field.name;
+            const Payload = field.type;
             if (@typeInfo(Payload) != .@"struct") @compileError(@typeName(T) ++ "." ++ name ++ " must be a struct");
             if (@hasField(Payload, tag_field)) {
                 @compileError(@typeName(Payload) ++ " has a field named '" ++ tag_field ++ "', which clashes with the discriminator of " ++ @typeName(T));
@@ -187,7 +191,7 @@ pub fn generateAnyOfPayloads(comptime T: type) []const u8 {
     @setEvalBranchQuota(100_000);
     return comptime blk: {
         var variants: []const u8 = "";
-        for (@typeInfo(T).@"union".field_types) |Payload| variants = listAppend(variants, schemaOf(Payload, null));
+        for (@typeInfo(T).@"union".fields) |field| variants = listAppend(variants, schemaOf(field.type, null));
         break :blk "{\"anyOf\":[" ++ variants ++ "]}";
     };
 }
@@ -269,11 +273,11 @@ fn findOptionalWithoutDefaultInner(comptime T: type, comptime path: []const u8, 
         .array => |info| return findOptionalWithoutDefaultInner(info.child, path, next_visited),
         .@"struct" => |info| {
             if (info.is_tuple or @hasDecl(T, "json_schema")) return null;
-            for (info.field_names, info.field_types, info.field_attrs) |name, FieldType, attrs| {
-                if (attrs.@"comptime") continue;
-                const field_path = path ++ "." ++ name;
-                if (@typeInfo(FieldType) == .optional and attrs.default_value_ptr == null) return field_path;
-                if (findOptionalWithoutDefaultInner(FieldType, field_path, next_visited)) |found| return found;
+            for (info.fields) |field| {
+                if (field.is_comptime) continue;
+                const field_path = path ++ "." ++ field.name;
+                if (@typeInfo(field.type) == .optional and field.default_value_ptr == null) return field_path;
+                if (findOptionalWithoutDefaultInner(field.type, field_path, next_visited)) |found| return found;
             }
             return null;
         },
@@ -282,8 +286,8 @@ fn findOptionalWithoutDefaultInner(comptime T: type, comptime path: []const u8, 
         .@"union" => |info| {
             const custom_parse = std.meta.hasFn(T, "jsonParse") or std.meta.hasFn(T, "jsonParseFromValue");
             if (custom_parse and !@hasDecl(T, "json_check_payload")) return null;
-            for (info.field_names, info.field_types) |name, Payload| {
-                if (findOptionalWithoutDefaultInner(Payload, path ++ "." ++ name, next_visited)) |found| return found;
+            for (info.fields) |field| {
+                if (findOptionalWithoutDefaultInner(field.type, path ++ "." ++ field.name, next_visited)) |found| return found;
             }
             return null;
         },

@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(stdio_server_exe);
 
     const run_stdio_server = b.addRunArtifact(stdio_server_exe);
-    run_stdio_server.addPassthruArgs();
+    if (b.args) |args| run_stdio_server.addArgs(args);
 
     const run_stdio_server_step = b.step("run-stdio-server", "Run the stdio-server example");
     run_stdio_server_step.dependOn(&run_stdio_server.step);
@@ -94,14 +94,14 @@ pub fn build(b: *std.Build) void {
     const e2e_test_script = e2e_files.addCopyFile(b.path("e2e/stdio_server.test.mjs"), "stdio_server.test.mjs");
 
     const npm_ci = std.Build.Step.Run.create(b, "npm ci");
-    npm_ci.addFileArg(b.findProgramLazy(.{ .names = &.{"npm"} }));
+    npm_ci.addArg(b.findProgram(&.{"npm"}, &.{}) catch "npm");
     npm_ci.addArgs(&.{ "ci", "--no-audit", "--no-fund" });
     npm_ci.setCwd(e2e_files.getDirectory());
     // Capturing the output makes the step cacheable.
     _ = npm_ci.captureStdOut(.{});
 
     const run_e2e = std.Build.Step.Run.create(b, "e2e stdio-server");
-    run_e2e.addFileArg(b.findProgramLazy(.{ .names = &.{"node"} }));
+    run_e2e.addArg(b.findProgram(&.{"node"}, &.{}) catch "node");
     run_e2e.addFileArg(e2e_test_script);
     run_e2e.addArtifactArg(stdio_server_exe);
     run_e2e.has_side_effects = true;

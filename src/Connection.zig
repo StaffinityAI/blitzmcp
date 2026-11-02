@@ -113,11 +113,11 @@ pub fn reset(c: *Connection) void {
 
 pub fn logLevel(c: *const Connection) ?types.LoggingLevel {
     const level = c.log_level.load(.acquire);
-    return if (level == no_log_level) null else @fromBackingInt(@intCast(level));
+    return if (level == no_log_level) null else @enumFromInt(level);
 }
 
 pub fn setLogLevel(c: *Connection, level: types.LoggingLevel) void {
-    c.log_level.store(@backingInt(level), .release);
+    c.log_level.store(@intFromEnum(level), .release);
 }
 
 /// Claims the handling of `initialize`. Returns `false` if the connection is

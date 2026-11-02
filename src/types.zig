@@ -789,9 +789,9 @@ pub fn TypeDiscriminated(comptime T: type) type {
             payload_options.ignore_unknown_fields = true;
 
             const info = @typeInfo(T).@"union";
-            inline for (info.field_names, info.field_types) |field_name, FieldType| {
-                if (std.mem.eql(u8, field_name, tag_value.string)) {
-                    return @unionInit(T, field_name, try std.json.innerParseFromValue(FieldType, allocator, source, payload_options));
+            inline for (info.fields) |field| {
+                if (std.mem.eql(u8, field.name, tag_value.string)) {
+                    return @unionInit(T, field.name, try std.json.innerParseFromValue(field.type, allocator, source, payload_options));
                 }
             }
             return error.InvalidEnumTag;
@@ -804,14 +804,14 @@ pub fn TypeDiscriminated(comptime T: type) type {
                     try stream.objectField(discriminator);
                     try stream.write(@tagName(tag));
                     const S = @typeInfo(@TypeOf(payload)).@"struct";
-                    inline for (S.field_names, S.field_types) |field_name, FieldType| {
-                        const field_value = @field(payload, field_name);
-                        const emit = if (@typeInfo(FieldType) == .optional)
+                    inline for (S.fields) |field| {
+                        const field_value = @field(payload, field.name);
+                        const emit = if (@typeInfo(field.type) == .optional)
                             stream.options.emit_null_optional_fields or field_value != null
                         else
                             true;
                         if (emit) {
-                            try stream.objectField(field_name);
+                            try stream.objectField(field.name);
                             try stream.write(field_value);
                         }
                     }

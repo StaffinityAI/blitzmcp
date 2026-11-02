@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+      - zig-0.16.0
   pull_request:
     branches:
       - main
+      - zig-0.16.0
   workflow_dispatch:
 
 jobs:
@@ -26,7 +28,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.16.0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -48,7 +50,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.16.0
 
       # A new seed for every run (and re-run) explores new inputs. The run is
       # not exactly reproducible from the seed (the fuzzer schedules the fuzz
@@ -58,7 +60,8 @@ jobs:
       # input, so check for the saved input explicitly. --fuzz is not
       # supported on Windows. The LLVM backend is required for the coverage
       # instrumentation the fuzzer needs (the self-hosted x86_64 backend
-      # produces none).
+      # produces none). Zig 0.16.0's test runner does not compile in fuzz mode
+      # with error return traces, so fuzz in ReleaseSafe, which disables them.
       - name: Fuzz
         id: fuzz
         shell: bash
@@ -66,7 +69,7 @@ jobs:
           seed=$(( (${{ github.run_id }} * 31 + ${{ github.run_attempt }}) % 4294967296 ))
           echo "Fuzzing with --seed=$seed"
           rm -rf .zig-cache/f
-          zig build test --fuzz=30K --seed=$seed -Duse-llvm --summary all
+          zig build test --fuzz=30K --seed $seed -Duse-llvm -Doptimize=ReleaseSafe --summary all
           if [ -e .zig-cache/f/crash ]; then
             echo "crashed=true" >> "$GITHUB_OUTPUT"
             echo "::error::Fuzzing found a failing input (see the output above for the test). Download the fuzz-crash artifact and add it to that test's corpus to reproduce it."

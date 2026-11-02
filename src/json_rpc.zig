@@ -147,7 +147,7 @@ pub const JsonRPCMessage = union(enum) {
                 pub const json_schema = "{\"type\":\"integer\"}";
 
                 pub fn jsonStringify(code: Code, stream: anytype) @TypeOf(stream.*).Error!void {
-                    try stream.write(@backingInt(code));
+                    try stream.write(@intFromEnum(code));
                 }
             };
         };
@@ -273,8 +273,7 @@ pub const JsonRPCMessage = union(enum) {
         var fields: Fields = .{};
 
         for (source.object.keys(), source.object.values()) |field_name, field_source| {
-            const field_names = @typeInfo(Fields).@"struct".field_names;
-            inline for (field_names) |name| {
+            inline for (comptime std.meta.fieldNames(Fields)) |name| {
                 if (std.mem.eql(u8, name, field_name)) {
                     const field_enum = comptime @field(std.meta.FieldEnum(Fields), name);
                     @field(fields, name) = try Fields.parseFromValue(field_enum, allocator, field_source, options);
@@ -567,19 +566,19 @@ pub const JsonRPCMessage = union(enum) {
             \\{"id": "id", "jsonrpc": "2.0", "result": null, "error": {"code": 3, "message": "foo", "data": null}}
         , .{ .response = .{
             .id = .{ .string = "id" },
-            .result_or_error = .{ .@"error" = .{ .code = @fromBackingInt(3), .message = "foo", .data = null } },
+            .result_or_error = .{ .@"error" = .{ .code = @enumFromInt(3), .message = "foo", .data = null } },
         } }, .{});
         try testParse(
             \\{"id": "id", "jsonrpc": "2.0", "error": {"code": 42, "message": "bar", "data": true}}
         , .{ .response = .{
             .id = .{ .string = "id" },
-            .result_or_error = .{ .@"error" = .{ .code = @fromBackingInt(42), .message = "bar", .data = .{ .bool = true } } },
+            .result_or_error = .{ .@"error" = .{ .code = @enumFromInt(42), .message = "bar", .data = .{ .bool = true } } },
         } }, .{});
         try testParse(
             \\{"id": "id", "jsonrpc": "2.0", "error": {"code": 42, "message": "bar"}, "result": null}
         , .{ .response = .{
             .id = .{ .string = "id" },
-            .result_or_error = .{ .@"error" = .{ .code = @fromBackingInt(42), .message = "bar", .data = null } },
+            .result_or_error = .{ .@"error" = .{ .code = @enumFromInt(42), .message = "bar", .data = null } },
         } }, .{});
     }
 

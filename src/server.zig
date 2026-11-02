@@ -104,7 +104,7 @@ pub const Context = struct {
     /// level requested by the client. `data` may be any JSON serializable value.
     pub fn log(ctx: *Context, level: types.LoggingLevel, logger: ?[]const u8, data: anytype) SendError!void {
         if (ctx.connection.logLevel()) |min_level| {
-            if (@backingInt(level) < @backingInt(min_level)) return;
+            if (@intFromEnum(level) < @intFromEnum(min_level)) return;
         }
         const Params = struct {
             level: types.LoggingLevel,
@@ -695,7 +695,8 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
             if (!is_initialize and !self.connection.isInitialized() and !allowedBeforeInitialize(request.method)) {
                 return ctx.respondError(.{ .code = .invalid_request, .message = "Server not initialized" });
             }
-            inline for (comptime std.meta.declarations(types.client_requests)) |method| {
+            inline for (comptime std.meta.declarations(types.client_requests)) |decl| {
+                const method = decl.name;
                 if ((comptime isImplemented(method)) and std.mem.eql(u8, request.method, method)) {
                     return self.handleKnownRequest(method, ctx, request);
                 }
@@ -849,7 +850,8 @@ pub fn Server(comptime Handler: type, comptime config: anytype) type {
                     if (params.requestId) |id| self.connection.cancelInFlight(ctx.io, id);
                 } else |_| {}
             }
-            inline for (comptime std.meta.declarations(types.client_notifications)) |method| {
+            inline for (comptime std.meta.declarations(types.client_notifications)) |decl| {
+                const method = decl.name;
                 if (@hasDecl(Handler, method) and std.mem.eql(u8, notification.method, method)) {
                     const M = @field(types.client_notifications, method);
                     const params: M.Params = if (M.Params == void) {} else std.json.parseFromValueLeaky(
@@ -898,16 +900,18 @@ fn optionalField(comptime value: anytype, comptime name: []const u8) ?[]const u8
 fn coerceStruct(comptime T: type, comptime value: anytype) T {
     if (@TypeOf(value) == T) return value;
     var result: T = .{};
-    for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
-        @field(result, name) = @field(value, name);
+    for (@typeInfo(@TypeOf(value)).@"struct".fields) |field| {
+        @field(result, field.name) = @field(value, field.name);
     }
     return result;
 }
 
 fn promptArguments(comptime Args: type) []const types.PromptArgument {
     const info = @typeInfo(Args).@"struct";
-    var list: [info.field_names.len]types.PromptArgument = undefined;
-    for (&list, info.field_names, info.field_types, info.field_attrs) |*argument, name, FieldType, attrs| {
+    var list: [info.fields.len]types.PromptArgument = undefined;
+    for (&list, info.fields) |*argument, field| {
+        const name = field.name;
+        const FieldType = field.type;
         if (FieldType != []const u8 and FieldType != ?[]const u8) {
             @compileError("prompt argument '" ++ name ++ "' of " ++ @typeName(Args) ++ " must be of type `[]const u8` or `?[]const u8`");
         }
@@ -918,7 +922,7 @@ fn promptArguments(comptime Args: type) []const types.PromptArgument {
         argument.* = .{
             .name = name,
             .description = description,
-            .required = FieldType == []const u8 and attrs.default_value_ptr == null,
+            .required = FieldType == []const u8 and field.default_value_ptr == null,
         };
     }
     const final = list;
@@ -1009,7 +1013,7 @@ fn checkJsonDepth(value: anytype, depth: usize) JsonValueError!void {
         .@"struct" => |info| {
             if (!checksContents(T)) return;
             try checkDepth(depth + 1);
-            inline for (info.field_names) |name| try checkJsonDepth(@field(value, name), depth + 1);
+            inline for (info.fields) |field| try checkJsonDepth(@field(value, field.name), depth + 1);
         },
         // Unions serialize as an object around their payload (or as the payload
         // itself), so counting one level is an upper bound for both.
@@ -1054,7 +1058,7 @@ test checkJson {
 
 /// The JSON-RPC error code for requests that are rejected because the server
 /// is at capacity.
-const server_busy: json_rpc.JsonRPCMessage.Response.Error.Code = @fromBackingInt(-32000);
+const server_busy: json_rpc.JsonRPCMessage.Response.Error.Code = @enumFromInt(-32000);
 
 /// What is known about a message, used to decide whether it can be answered.
 const MessageKind = union(enum) {
@@ -1307,8 +1311,8 @@ fn ArgsType(comptime Handler: type, comptime def: anytype) type {
     const info = FnInfo(def.call);
     var Args: type = void;
     var found = false;
-    for (info.param_types) |maybe_P| {
-        const P = maybe_P orelse @compileError("'" ++ def.name ++ "': generic parameters are not supported");
+    for (info.params) |param| {
+        const P = param.type orelse @compileError("'" ++ def.name ++ "': generic parameters are not supported");
         if (paramKind(Handler, P) != .args) continue;
         if (found) @compileError("'" ++ def.name ++ "' has more than one arguments parameter");
         Args = P;
@@ -1334,8 +1338,8 @@ fn callInjected(
     const Handler = @TypeOf(handler.*);
     const info = FnInfo(func);
     var call_args: std.meta.ArgsTuple(@TypeOf(func)) = undefined;
-    inline for (info.param_types, 0..) |P, i| {
-        call_args[i] = switch (comptime paramKind(Handler, P.?)) {
+    inline for (info.params, 0..) |param, i| {
+        call_args[i] = switch (comptime paramKind(Handler, param.type.?)) {
             .handler_value => handler.*,
             .handler_ptr => handler,
             .arena => ctx.arena,

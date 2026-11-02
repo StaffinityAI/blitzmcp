@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Backported to Zig 0.16.0 (`zig-0.16.0` branch).
+
 ## [0.1.0] - 2026-11-01
 
 First release. Building blocks for [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-11-25) servers (spec 2025-11-25) in Zig 0.17, derived from [zigtools/lsp-kit](https://github.com/zigtools/lsp-kit).
